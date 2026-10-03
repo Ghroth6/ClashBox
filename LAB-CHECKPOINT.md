@@ -1,21 +1,15 @@
-# Personal configuration-preservation checkpoint
+# Personal application checkpoint
 
-This branch derives from xiaobaigroup/ClashBox at
-`e036a6a3097192ff74987ce7306eea2a03d6a3ac`. It preserves imported configuration
-and referenced resources, requires an explicit nonempty application allowlist,
-and waits for native VPN startup/protection acknowledgement.
+Derived from xiaobaigroup/ClashBox at e036a6a3097192ff74987ce7306eea2a03d6a3ac.
+Preserves imported configuration and resources, enforces a nonempty application
+allowlist, and waits for native startup/protection acknowledgement.
 
-The Windows build profile is unsigned and ARM64-only. Host tests and local
-builds have passed; device routing, protection, and long-running stability
-have not been verified. This is not the original upstream 1.7.4 binary.
+The old derived core route and its release artifacts have been withdrawn.
+Core development starts from MetaCubeX/mihomo; its OHOS adaptation is pending.
+There is currently no supported native library or installable HAP for this
+branch. Old binaries in upstream history and build caches must not be packaged.
+Application host tests do not establish native compatibility or device safety.
 
-The generated `proxy_core/libs/arm64-v8a/libflclash.so` is intentionally not
-tracked on this branch. Build it from the matching wrapper, author core,
-gVisor and OHOS Go sources, or restore the exact checkpoint asset and verify
-its SHA-256 before packaging. Old binaries in upstream history are not a
-substitute for this branch's matching build.
-
-Upstream submodule entries are historical; do not recursively initialize them
-as the tested dependency combination. The personal multi-repository workspace
-manifest and build instructions are maintained in the private coordination
-repository. Upstream origins are preserved; upstream licensing still applies.
+Backend submodule entries have been removed. The personal workspace manifest
+manages canonical Mihomo separately; compiler and dependency provenance remain
+documented in the private coordination repository. Upstream licenses apply.
