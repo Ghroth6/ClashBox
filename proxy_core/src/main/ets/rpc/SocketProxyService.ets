@@ -1,3 +1,4 @@
+import { requireAllowlist } from './AllowlistPolicy';
 import { socket, vpnExtension } from '@kit.NetworkKit';
 import {  RpcResult } from './RpcRequest';
 import { JSON, util } from '@kit.ArkTS';
@@ -282,6 +283,12 @@ export class SocketProxyService implements IClashManager {
   }
   vpnConnection : vpnExtension.VpnConnection | undefined
   async getTunFd(config: VpnConfig): Promise<number> {
+    if (config.blockedApplications && config.blockedApplications.length > 0) {
+      throw new Error('本实验版不接受黑名单 VPN 配置');
+    }
+    config.trustedApplications = requireAllowlist(true, 'AcceptSelected', config.trustedApplications ?? []);
+    config.blockedApplications = undefined;
+
     let tunFd = -1
     try {
       this.vpnConnection = vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext);

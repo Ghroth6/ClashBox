@@ -33,47 +33,15 @@ type ProcessMap struct {
 	m sync.Map
 }
 
-type FdMap struct {
-	m sync.Map
-}
-
-type FdWaitMap struct {
-	m sync.Map
-}
-
-func (wm *FdWaitMap) Store(key int64, ch chan struct{}) {
-	wm.m.Store(key, ch)
-}
-
-func (wm *FdWaitMap) Load(key int64) (chan struct{}, bool) {
-	value, ok := wm.m.Load(key)
-	if !ok || value == nil {
-		return nil, false
-	}
-	return value.(chan struct{}), true
-}
-
-func (wm *FdWaitMap) Delete(key int64) {
-	wm.m.Delete(key)
-}
-
-type Fd struct {
-	Id    int64 `json:"id"`
-	Value int64 `json:"value"`
-}
-
 var (
-	tunListener      *sing_tun.Listener
-	fdMap            FdMap
-	fdWaitMap        FdWaitMap
-	fdCounter        int64 = 0
-	counter          int64 = 0
-	processMap       ProcessMap
-	tunLock          sync.Mutex
-	runTime          *time.Time
-	errBlocked       = errors.New("blocked")
-	keepaliveStop    chan struct{}
-	keepaliveOnce    sync.Once
+	tunListener   *sing_tun.Listener
+	counter       int64 = 0
+	processMap    ProcessMap
+	tunLock       sync.Mutex
+	runTime       *time.Time
+	errBlocked    = errors.New("blocked")
+	keepaliveStop chan struct{}
+	keepaliveOnce sync.Once
 )
 
 func (cm *ProcessMap) Store(key int64, value string) {
@@ -88,37 +56,29 @@ func (cm *ProcessMap) Load(key int64) (string, bool) {
 	return value.(string), true
 }
 
-func (cm *FdMap) Store(key int64) {
-	cm.m.Store(key, struct{}{})
-}
-
-func (cm *FdMap) Load(key int64) bool {
-	_, ok := cm.m.Load(key)
-	return ok
-}
-
-func StartTUN(fd int, markSocket func(Fd)) {
-	if fd == 0 {
-		tunLock.Lock()
-		defer tunLock.Unlock()
-		now := time.Now()
-		runTime = &now
-		return
+func StartTUN(fd int, markSocket func(Fd)) error {
+	tunLock.Lock()
+	defer tunLock.Unlock()
+	if fd <= 0 {
+		return errors.New("invalid system TUN descriptor")
+	}
+	if currentConfig == nil {
+		return errors.New("configuration is not loaded")
+	}
+	if tunListener != nil {
+		return errors.New("TUN is already running")
 	}
 	initSocketHook(markSocket)
-	go func() {
-		tunLock.Lock()
-		defer tunLock.Unlock()
-		f := int(fd)
-		tunListener, _ = t.Start(f, currentConfig.General.Tun.Device, currentConfig.General.Tun.Stack, currentConfig.General.Tun.DNSHijack)
-		if tunListener != nil {
-			log.Infoln("TUN address: %v", tunListener.Address())
-		}
-		now := time.Now()
-		runTime = &now
-	}()
-	// 启动后台保活 goroutine：每 60s 关闭空闲连接防止 NAT 超时
+	listener, err := t.Start(fd, currentConfig.General.Tun.Device, currentConfig.General.Tun.Stack, currentConfig.General.Tun.DNSHijack)
+	if err != nil {
+		removeSocketHook()
+		return err
+	}
+	tunListener = listener
+	now := time.Now()
+	runTime = &now
 	startKeepalive()
+	return nil
 }
 
 func startKeepalive() {
@@ -128,43 +88,44 @@ func startKeepalive() {
 	// 先停止已有保活
 	stopKeepalive()
 	keepaliveStop = make(chan struct{})
+	stop := keepaliveStop
 	go func() {
-	 ticker := time.NewTicker(60 * time.Second)
-	 defer ticker.Stop()
-	 log.Infoln("[Keepalive] TUN 保活 goroutine 已启动")
-	 for {
-	  select {
-	  case <-ticker.C:
-	       // 直连模式下不需要健康检查和空闲连接清理
-	       if currentConfig != nil && string(currentConfig.General.Mode) == "direct" {
-	        continue
-	       }
-	       // 仅在有活跃连接时才做健康检查, 无流量时跳过以降低功耗
-	       connSnapshot := statistic.DefaultManager.Snapshot()
-	       if connSnapshot != nil && connSnapshot.ConnectionCount() > 0 {
-	        go handleHealthCheckAll()
-	       }
-	   func() {
-	    runLock.Lock()
-	    defer runLock.Unlock()
-	    if tunListener == nil {
-	     return
-	    }
-	    // 关闭所有空闲连接，强制 NAT 重新建立映射
-	    n := 0
-	    statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
-	     // 仅关闭已空闲超过 120s 的连接
-	     if time.Since(c.LastActivity()) > 120*time.Second {
-	      _ = c.Close()
-	      n++
-	     }
-	     return true
-	    })
-	    if n > 0 {
-	     log.Infoln("[Keepalive] 已关闭 %d 个空闲连接", n)
-	    }
-	   }()
-			case <-keepaliveStop:
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		log.Infoln("[Keepalive] TUN 保活 goroutine 已启动")
+		for {
+			select {
+			case <-ticker.C:
+				// 直连模式下不需要健康检查和空闲连接清理
+				if currentConfig != nil && string(currentConfig.General.Mode) == "direct" {
+					continue
+				}
+				// 仅在有活跃连接时才做健康检查, 无流量时跳过以降低功耗
+				connSnapshot := statistic.DefaultManager.Snapshot()
+				if connSnapshot != nil && connSnapshot.ConnectionCount() > 0 {
+					go handleHealthCheckAll()
+				}
+				func() {
+					runLock.Lock()
+					defer runLock.Unlock()
+					if tunListener == nil {
+						return
+					}
+					// 关闭所有空闲连接，强制 NAT 重新建立映射
+					n := 0
+					statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
+						// 仅关闭已空闲超过 120s 的连接
+						if time.Since(c.LastActivity()) > 120*time.Second {
+							_ = c.Close()
+							n++
+						}
+						return true
+					})
+					if n > 0 {
+						log.Infoln("[Keepalive] 已关闭 %d 个空闲连接", n)
+					}
+				}()
+			case <-stop:
 				log.Infoln("[Keepalive] TUN 保活 goroutine 已停止")
 				return
 			}
@@ -185,6 +146,8 @@ func stopKeepalive() {
 }
 
 func GetRunTime() string {
+	tunLock.Lock()
+	defer tunLock.Unlock()
 	if runTime == nil {
 		return "clash服务未启动"
 	}
@@ -198,71 +161,27 @@ func ConfigInited() string {
 }
 
 func StopTun() {
+	tunLock.Lock()
+	defer tunLock.Unlock()
 	stopKeepalive()
-	go func() {
-		tunLock.Lock()
-		defer tunLock.Unlock()
-
-		runTime = nil
-
-		if tunListener != nil {
-			_ = tunListener.Close()
-		}
-		removeSocketHook()
-		// 关闭 VPN 时立即刷新 DNS 缓存，避免 HarmonyOS 系统 10 分钟 DNS 缓存 TTL
-		// 导致应用继续使用 VPN DNS 解析的过期记录
-		dns.FlushCacheWithDefaultResolver()
-	}()
+	runTime = nil
+	if tunListener != nil {
+		_ = tunListener.Close()
+		tunListener = nil
+	}
+	removeSocketHook()
+	dns.FlushCacheWithDefaultResolver()
 }
 
-func SetFdMap(fd C.long) {
-	fdInt := int64(fd)
-	go func() {
-		fdMap.Store(fdInt)
-		// 通知等待的 initSocketHook 协程，避免忙等待轮询
-		if ch, ok := fdWaitMap.Load(fdInt); ok {
-			select {
-			case ch <- struct{}{}:
-			default:
-			}
-		}
-	}()
-}
+func SetFdMap(fd C.long) { acknowledgeProtectedSocket(int64(fd)) }
 
 func initSocketHook(markSocket func(Fd)) {
 	dialer.DefaultSocketHook = func(network, address string, conn syscall.RawConn) error {
 		if platform.ShouldBlockConnection() {
 			return errBlocked
 		}
-		return conn.Control(func(fd uintptr) {
-			fdInt := int64(fd)
-			id := atomic.AddInt64(&fdCounter, 1)
-
-			// 直连模式下无需保护 socket，直接返回
-			if currentConfig != nil && string(currentConfig.General.Mode) == "direct" {
-				return
-			}
-
-			// 创建等待 channel，替代忙等待轮询
-			waitCh := make(chan struct{}, 1)
-			fdWaitMap.Store(id, waitCh)
-
-			markSocket(Fd{
-				Id:    id,
-				Value: fdInt,
-			})
-
-			// 等待 SetFdMap 通知。
-			// 后台无长时任务时，VPN 进程 JS 事件循环会被系统限流，protect IPC 往返
-			// 可能超过 500ms；超时会导致出站 fd 未绕过 TUN → 流量回环 → DNS 全断。
-			// 放宽到 5s，并记录超时点便于排查（hilog | grep SocketHook protect）
-			select {
-			case <-waitCh:
-			case <-time.After(5 * time.Second):
-				log.Warnln("[SocketHook] protect wait timeout, fd=%d id=%d socket un-protected, may loop into TUN", fdInt, id)
-			}
-			fdWaitMap.Delete(id)
-		})
+		// DIRECT traffic also needs protection from being recaptured by this TUN.
+		return protectOutboundSocket(conn, markSocket, 5*time.Second)
 	}
 }
 

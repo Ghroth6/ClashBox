@@ -1,3 +1,4 @@
+import { requireAllowlist } from './AllowlistPolicy';
 import { vpnExtension, socket } from '@kit.NetworkKit';
 import {
   startTun, stopTun, setFdMap, getVpnOptions, startLog, getProxies, getTraffic,
@@ -22,17 +23,11 @@ import {
   startListener,
   stopListener
 } from 'libflclash.so';
-import {
-  Address,
-  AddressWithPrefix,
-  cidrToRoute,
-  CommonVpnService,
-  VpnConfig
-} from './CommonVpnService';
+import { Address, AddressWithPrefix, CommonVpnService, cidrToRoute, VpnConfig } from './CommonVpnService';
 import { JSON, util } from '@kit.ArkTS';
 import { RpcRequest, RpcResult } from './RpcRequest';
 import { ClashRpcType } from './IClashManager';
-import { ConnectionInfo, LogInfo, Provider, ProxyGroup, ProxyMode, ProxyType, Traffic } from '../models/Common';
+import { ConnectionInfo, LogInfo, Proxy, Provider, ProxyGroup, ProxyMode, ProxyType, Traffic } from '../models/Common';
 import { getHome, getProfilePath } from '../appPath';
 import { ClashConfig, Tun, UpdateConfigParams } from '../models/ClashConfig';
 import { readFile, readFileUri, readText } from '../fileUtils';
@@ -48,12 +43,15 @@ export interface VpnOptions {
   port: number,
   ipv4Address: string,
   ipv6Address: string,
+  ipv6?: boolean,
   accessControl: AccessControl,
   systemProxy: boolean,
   allowBypass: boolean,
   routeAddress: string[],
   bypassDomain: string[],
   dnsServerAddress: string,
+  /** 最大传输单元: 缺省 1400 */
+  mtu?: number,
 }
 
 
@@ -61,10 +59,11 @@ export class FlClashVpnService extends CommonVpnService {
   vpnConnection: vpnExtension.VpnConnection | undefined
   public configPath: string = ""
   protectSocketPath: string = ""
+  private clashSocket: socket.LocalSocket | undefined
+  private textDecoder: util.TextDecoder = new util.TextDecoder()
 
   override async onRemoteMessageRequest(client: socket.LocalSocketConnection, message: socket.LocalSocketMessageInfo): Promise<void> {
-    let decoder = new util.TextDecoder()
-    let request = JSON.parse(decoder.decodeToString(new Uint8Array(message.message))) as RpcRequest
+    let request = JSON.parse(this.textDecoder.decodeToString(new Uint8Array(message.message))) as RpcRequest
     let code = request.method
     let params = request.params
     try {
@@ -75,11 +74,15 @@ export class FlClashVpnService extends CommonVpnService {
       this.sendClient(client, JSON.stringify({ error: e.message ?? e }))
     }
   }
+  /** 防止多次调用 stopVpn 导致 stopTun 重复执行 */
+  private isStopped: boolean = false
+
   onRemoteMessage(code: number, data: (string | number | boolean)[]): Promise<string | number | boolean> {
     // 根据code处理客户端的请求
     return new Promise(async (resolve, reject) => {
       switch (code) {
         case ClashRpcType.startClash: {
+          this.ParseConfig() // Reject invalid scope before opening core listeners.
           startListener()
           this.startVpn().then((r) => {
             resolve(r)
@@ -89,8 +92,9 @@ export class FlClashVpnService extends CommonVpnService {
           break;
         }
         case ClashRpcType.stopClash: {
-          stopListener()
+          // ★ 先停止 tun 再停止 listener，防止 Go 内部清理和 stopTun() 竞争导致 NULL 指针崩溃
           this.stopVpn()
+          stopListener()
           resolve(true)
           break;
         }
@@ -104,6 +108,8 @@ export class FlClashVpnService extends CommonVpnService {
   ParseConfig(): VpnConfig {
     let vpnConfig = new VpnConfig();
     let option = JSON.parse(getVpnOptions()) as VpnOptions
+    // 根据 ipv6 开关决定是否启用 IPv6 地址和路由
+    const vpnIpv6Enabled = option.ipv6 !== false
     if (option.ipv6Address == undefined || option.ipv6Address == "") {
       option.ipv6Address = "fdfe:dcba:9876::1/126"
     }
@@ -117,7 +123,7 @@ export class FlClashVpnService extends CommonVpnService {
       vpnConfig.addresses[0] = new AddressWithPrefix(new Address(ips[0], 1), prefixLength)
       vpnConfig.isIPv4Accepted = true
     }
-    if (option.ipv6Address != "") {
+    if (vpnIpv6Enabled && option.ipv6Address != "") {
       const ips = option.ipv6Address.split("/")
       const prefixLength = ips.length > 1 ? parseInt(ips[1]) : 126
       vpnConfig.addresses.push(new AddressWithPrefix(new Address(ips[0], 2), prefixLength))
@@ -134,7 +140,7 @@ export class FlClashVpnService extends CommonVpnService {
     if (option.ipv4Address != "") {
       addRouteAddress("0.0.0.0/0")
     }
-    if (option.ipv6Address != "") {
+    if (vpnIpv6Enabled && option.ipv6Address != "") {
       addRouteAddress("::/0")
     }
     routeAddresses.forEach((cidr) => {
@@ -143,13 +149,16 @@ export class FlClashVpnService extends CommonVpnService {
         vpnConfig.routes.push(route)
       }
     })
-    if (option.accessControl?.mode) {
-      if (option.accessControl?.mode == "AcceptSelected") {
-        vpnConfig.trustedApplications = option.accessControl?.acceptList
-      } else {
-        vpnConfig.blockedApplications = option.accessControl?.rejectList
-      }
+    const trusted = requireAllowlist(true, option.accessControl?.mode ?? '', option.accessControl?.acceptList ?? []);
+    vpnConfig.trustedApplications = trusted;
+    // Never attach blockedApplications together with trustedApplications.
+    if (option.dnsServerAddress && option.dnsServerAddress != "") {
+      vpnConfig.dnsAddresses = [option.dnsServerAddress]
+    } else {
+      vpnConfig.dnsAddresses = ["172.19.0.2"]
     }
+    // ★ MTU: 优先使用用户配置(1280-65535), 缺省 1400
+    vpnConfig.mtu = (option.mtu && option.mtu >= 1280 && option.mtu <= 65535) ? option.mtu : 1400
     if (option.systemProxy || option.allowBypass) {
       // TODO ohos 不支持
       // not use option.bypassDomain option.port
@@ -158,55 +167,141 @@ export class FlClashVpnService extends CommonVpnService {
     return vpnConfig;
   }
   override async startVpn(): Promise<boolean> {
-
+    // ★ 重置停止标记，允许下次 stopVpn 正常关闭资源
+    this.isStopped = false
+    if (this.vpnConnection) {
+      this.vpnConnection.destroy()
+      this.vpnConnection = undefined
+      // 系统级 VPN 连接销毁后需要时间回收 TUN 路由/protect 通道，
+      // 立即重建（卡片冷启动→关闭→UI 再启动场景）会叠加残留状态，
+      // 后台大流量时 protect 超时 → 流量回环 → 代理与直连全断
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 500)
+      })
+    }
     let config = this.ParseConfig();
     let tunFd = -1
     try {
       tunFd = await super.getTunFd(config)
       if (tunFd > -1) {
-        this.startClash(tunFd)
+        await this.startClash(tunFd)
       }
       return tunFd > -1;
     } catch (error) {
       console.error("ClashVPN  error ", error)
+      this.stopVpn()
+      stopListener()
       return false
     }
   }
 
-  startClash(tunFd: number) {
+  async startClash(tunFd: number): Promise<void> {
+    this.clashSocket?.off('message')
+    this.clashSocket?.close()
     let tcp: socket.LocalSocket = socket.constructLocalSocketInstance();
-    tcp.on('message', async (value: socket.LocalSocketMessageInfo) => {
-      let text = new util.TextDecoder()
-      let dd = text.decodeToString(new Uint8Array(value.message))
-      let list = dd.split("EOF")
-      for (let index = 0; index < list.length; index++) {
-        const element = list[index];
-        try {
-          if (element != "") {
-            let json = JSON.parse(element) as RpcResult
-            let fd = JSON.parse(json.result as string) as Fd
-            await this.protect(fd.value)
-            setFdMap(fd.id)
-          }
-        } catch (e) {
-          console.error("ClashVPN protect error", e.message, element)
+    this.clashSocket = tcp
+    const socketPath = this.context?.filesDir + '/clash_go.sock'
+    await new Promise<void>((resolve, reject) => {
+      let pending = ''
+      let settled = false
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true
+          reject(new Error('等待原生 TUN 启动确认超时'))
+        }
+      }, 10000)
+      const fail = (error: Error) => {
+        if (!settled) {
+          settled = true
+          clearTimeout(timer)
+          reject(error)
         }
       }
-    })
-    const socketPath = this.context?.filesDir + '/clash_go.sock'
-    console.error("ClashVPN connect", tunFd)
-    tcp.connect({ address: { address: socketPath }, timeout: 1000 }).then(() => {
-      console.error("ClashVPN connect", tunFd)
-      tcp.send({ data: JSON.stringify({ method: ClashRpcType.startClash, params: [tunFd] }) });
-    }).catch((e) => {
-      console.error("ClashVPN  error ", e.message, e)
+      tcp.on('message', (value: socket.LocalSocketMessageInfo) => {
+        pending += this.textDecoder.decodeToString(new Uint8Array(value.message))
+        if (pending.length > 65536) {
+          fail(new Error('原生 TUN 响应过长'))
+          return
+        }
+        let boundary = pending.indexOf('EOF')
+        while (boundary >= 0) {
+          const element = pending.substring(0, boundary)
+          pending = pending.substring(boundary + 3)
+          if (element !== '') {
+            try {
+              const result = JSON.parse(element) as RpcResult
+              if (result.error) {
+                fail(new Error(result.error))
+              } else if (result.result === 'tun-ready') {
+                if (!settled) {
+                  settled = true
+                  clearTimeout(timer)
+                  resolve()
+                }
+              } else {
+                this.handleProtectMessage(element)
+              }
+            } catch (error) {
+              fail(error as Error)
+            }
+          }
+          boundary = pending.indexOf('EOF')
+        }
+      })
+      tcp.connect({ address: { address: socketPath }, timeout: 1000 }).then(async () => {
+        await tcp.send({ data: JSON.stringify({ method: ClashRpcType.startClash, params: [tunFd] }) })
+      }).catch((error: Error) => fail(error))
     })
   }
 
+  /**
+   * 单个 protect 消息的异步处理：解析 fd → protect（带重试）→ setFdMap。
+   * 每个 fd 独立执行，互不阻塞。protect 失败会导致该出站 fd 未绕过 TUN → 流量回环 → 直连断网。
+   */
+  private handleProtectMessage(element: string): void {
+    if (element == "") return
+    try {
+      let json = JSON.parse(element) as RpcResult
+      let fd = JSON.parse(json.result as string) as Fd
+      this.protectWithRetry(fd.value, 3).then(() => {
+        setFdMap(fd.id)
+      }).catch((protectErr: Error) => {
+        // 重试仍失败：打 hilog 点便于确认后台 protect 是否被系统中断（hilog | grep ClashVPN protect）
+        console.error("ClashVPN protect failed after retry, skipping setFdMap for fd.id=" + fd.id, protectErr.message, element)
+      })
+    } catch (e) {
+      console.error("ClashVPN message parse error", (e as Error).message, element)
+    }
+  }
 
   stopVpn() {
+    if (this.isStopped) return
+    this.isStopped = true
+    this.clashSocket?.off('message')
+    this.clashSocket?.close()
+    this.clashSocket = undefined
     stopTun()
     super.stopVpn()
+  }
+
+  /**
+   * protect 带重试：后台 Extension 进程受限时 vpnConnection.protect 可能偶发失败，
+   * 失败重试可避免出站 fd 未保护导致流量回环（直连断网）
+   */
+  private async protectWithRetry(fd: number, retries: number): Promise<void> {
+    let lastErr: Error | undefined = undefined
+    for (let i = 0; i < retries; i++) {
+      try {
+        await this.protect(fd)
+        return
+      } catch (e) {
+        lastErr = e as Error
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 100)
+        })
+      }
+    }
+    throw lastErr ?? new Error('protect failed')
   }
   override async init() {
     initClash(await getHome(this.context), "1.0.0")
@@ -218,47 +313,59 @@ export interface Fd {
   value: number
 }
 
-export function ParseProxyGroup(mode, result: string): ProxyGroup[] {
-  if (result == null)
+export function ParseProxyGroup(mode: ProxyMode, result: string): ProxyGroup[] {
+  if (result == null || result.length === 0)
     return []
-  const map = JSON.parse(result) as Record<string, string | Record<string, string[] | string>>
+  const map = JSON.parse(result) as Record<string, Record<string, string | string[] | boolean | number | undefined>>
   const global = map[ProxyMode.Global]
-  let groupNames = global?.["all"] as string[] ?? []
+  let groupNames: string[] = (global?.["all"] as string[] | undefined) ?? []
   if (mode == ProxyMode.Global) {
     groupNames = ["GLOBAL", ...groupNames]
   } else if (mode == ProxyMode.Rule) {
-    groupNames = groupNames
+    // keep groupNames as is
   } else {
     groupNames = []
   }
   groupNames = groupNames.filter(e => {
-    const proxy = map[e] as Record<string, string>
+    const proxy = map[e]
     if (!proxy)
       return false
-    const indexes = ["Selector", "URLTest", "Fallback", "LoadBalance", "Relay"].indexOf(proxy["type"])
-    return indexes > -1
+    return ["Selector", "URLTest", "Fallback", "LoadBalance", "Relay"].indexOf(proxy["type"] as string) > -1
   })
-  const groupsRaw = groupNames.map((groupName) => {
+  const groupsRaw: (ProxyGroup | null)[] = groupNames.map((groupName) => {
     const group = map[groupName];
-    if (group){
-      group["proxies"] = (group["all"] ?? []).map((n: string) => {
-        if(!map[n]){
-          return;
-        }
-        map[n]["name"] = map[n]?.["name"]
-        return map[n]
-      }).filter((d: string) => d != null && d != undefined)
-      return {
-        name: group["name"] as string,
-        now: group["now"] as string,
-        type: group["type"] as ProxyType,
-        hidden: group["hidden"] == true,
-        icon: group["icon"] as string,
-        proxies: group["proxies"]
-      } as ProxyGroup
-    } else {
+    if (!group) {
       return null;
     }
+    const rawAll = group["all"]
+    const allNames: string[] = Array.isArray(rawAll) ? rawAll as string[] : []
+    const proxies: Proxy[] = []
+    for (const n of allNames) {
+      const rawProxy = map[n];
+      if (!rawProxy) {
+        continue;
+      }
+      const proxyName = (rawProxy["name"] as string | undefined) ?? n;
+      const proxyType = (rawProxy["type"] as string | undefined) ?? "Reject";
+      proxies.push({
+        name: proxyName,
+        type: proxyType as ProxyType,
+        display: (rawProxy["display"] as string | undefined) ?? "",
+        id: rawProxy["id"] as string | undefined,
+        g: rawProxy["g"] as string | undefined,
+        icon: rawProxy["icon"] as string | undefined,
+        latency: rawProxy["latency"] as number | undefined,
+      })
+    }
+    return {
+      name: (group["name"] as string) ?? "",
+      now: (group["now"] as string) ?? "",
+      type: (group["type"] as ProxyType) ?? ProxyType.Reject,
+      display: (group["display"] as string) ?? "",
+      hidden: group["hidden"] == true,
+      icon: group["icon"] as string | undefined,
+      proxies: proxies
+    } as ProxyGroup
   })
-  return groupsRaw.filter(g => g != null);
+  return groupsRaw.filter(g => g != null) as ProxyGroup[];
 }

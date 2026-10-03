@@ -104,7 +104,10 @@ func handleUpdateConfig(bytes []byte) string {
 	}
 
 	configParams = params.Params
-	prof := decorationConfig(params.ProfileId, params.Config)
+	prof, err := decorationConfig(params.ProfileId, params.Config)
+	if err != nil {
+		return err.Error()
+	}
 	err = applyConfig(prof)
 	if err != nil {
 		return err.Error()
@@ -242,77 +245,77 @@ func handleAsyncTestDelay(paramsString string, fn func(string)) {
 		data, _ := json.Marshal(delayData)
 		fn(string(data))
 		return false, nil
-		})
-		 }
+	})
+}
 
-		 func handleAsyncTestDelayBatch(paramsString string, fn func(string)) {
-		  var params = &TestDelayBatchParams{}
-		  err := json.Unmarshal([]byte(paramsString), params)
-		  if err != nil || len(params.ProxyNames) == 0 {
-		   fn("[]")
-		   return
-		  }
+func handleAsyncTestDelayBatch(paramsString string, fn func(string)) {
+	var params = &TestDelayBatchParams{}
+	err := json.Unmarshal([]byte(paramsString), params)
+	if err != nil || len(params.ProxyNames) == 0 {
+		fn("[]")
+		return
+	}
 
-		  expectedStatus, err := utils.NewUnsignedRanges[uint16]("")
-		  if err != nil {
-		   fn("[]")
-		   return
-		  }
+	expectedStatus, err := utils.NewUnsignedRanges[uint16]("")
+	if err != nil {
+		fn("[]")
+		return
+	}
 
-		  testURL := constant.DefaultTestURL
-		  if params.TestURL != "" {
-		   testURL = params.TestURL
-		  }
+	testURL := constant.DefaultTestURL
+	if params.TestURL != "" {
+		testURL = params.TestURL
+	}
 
-		  proxies := tunnel.ProxiesWithProviders()
-		  var mu sync.Mutex
-		  results := make([]Delay, 0, len(params.ProxyNames))
-		  sem := make(chan struct{}, 50)
-		  var wg sync.WaitGroup
+	proxies := tunnel.ProxiesWithProviders()
+	var mu sync.Mutex
+	results := make([]Delay, 0, len(params.ProxyNames))
+	sem := make(chan struct{}, 50)
+	var wg sync.WaitGroup
 
-		  for _, proxyName := range params.ProxyNames {
-		   proxy := proxies[proxyName]
-		   if proxy == nil {
-		    mu.Lock()
-		    results = append(results, Delay{Name: proxyName, Value: -1})
-		    mu.Unlock()
-		    continue
-		   }
+	for _, proxyName := range params.ProxyNames {
+		proxy := proxies[proxyName]
+		if proxy == nil {
+			mu.Lock()
+			results = append(results, Delay{Name: proxyName, Value: -1})
+			mu.Unlock()
+			continue
+		}
 
-		   sem <- struct{}{}
-		   wg.Add(1)
-		   go func(name string, p constant.Proxy) {
-		    defer func() {
-		     <-sem
-		     wg.Done()
-		    }()
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(name string, p constant.Proxy) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
 
-		    ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(params.Timeout))
-		    defer cancel()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(params.Timeout))
+			defer cancel()
 
-		    d := Delay{Name: name}
-		    delay, err := p.URLTest(ctx, testURL, expectedStatus)
-		    if err != nil || delay == 0 {
-		     d.Value = -1
-		    } else {
-		     d.Value = int32(delay)
-		    }
+			d := Delay{Name: name}
+			delay, err := p.URLTest(ctx, testURL, expectedStatus)
+			if err != nil || delay == 0 {
+				d.Value = -1
+			} else {
+				d.Value = int32(delay)
+			}
 
-		    mu.Lock()
-		    results = append(results, d)
-		    mu.Unlock()
-		   }(proxyName, proxy)
-		  }
+			mu.Lock()
+			results = append(results, d)
+			mu.Unlock()
+		}(proxyName, proxy)
+	}
 
-		  // 不阻塞 IPC handler，后台等待所有测试完成再回调
-		  go func() {
-		   wg.Wait()
-		   data, _ := json.Marshal(results)
-		   fn(string(data))
-		  }()
-		 }
+	// 不阻塞 IPC handler，后台等待所有测试完成再回调
+	go func() {
+		wg.Wait()
+		data, _ := json.Marshal(results)
+		fn(string(data))
+	}()
+}
 
-		 func handleHealthCheckAll() {
+func handleHealthCheckAll() {
 	healthCheckMu.Lock()
 	if healthCheckRunning {
 		healthCheckMu.Unlock()
@@ -664,6 +667,7 @@ func handleGetMemory(fn func(value string)) {
 }
 
 var reqeustList = []statistic.Tracker{}
+
 const maxRequestList = 1000
 
 func init() {

@@ -26,11 +26,14 @@ func initClash(env js.Env, this js.Value, args []js.Value) any {
 func startTun(env js.Env, this js.Value, args []js.Value) any {
 	tunFd, _ := napi.GetValueInt32(env.Env, args[0].Value)
 	tsfn := env.CreateThreadsafeFunction(args[1], "startTun")
-	StartTUN(int(tunFd), func(fd Fd) {
+	err := StartTUN(int(tunFd), func(fd Fd) {
 
 		tsfn.Call(env.ValueOf(fd.Id), env.ValueOf(fd.Value))
 	})
-	return nil
+	if err != nil {
+		return err.Error()
+	}
+	return ""
 }
 func stopTun(env js.Env, this js.Value, args []js.Value) any {
 	StopTun()
@@ -49,7 +52,7 @@ func validateConfig(env js.Env, this js.Value, args []js.Value) any {
 
 func updateConfig(env js.Env, this js.Value, args []js.Value) any {
 	paramsString, _ := napi.GetValueStringUtf8(env.Env, args[0].Value)
-	fmt.Println("updateConfig", paramsString)
+	fmt.Println("updateConfig requested")
 	promise := env.NewPromise()
 	bytes := []byte(paramsString)
 	go func() {
@@ -206,9 +209,7 @@ func getCurrentProfileName(env js.Env, this js.Value, args []js.Value) any {
 
 func setFdMap(env js.Env, this js.Value, args []js.Value) any {
 	fdInt, _ := napi.GetValueInt32(env.Env, args[0].Value)
-	go func() {
-		fdMap.Store(int64(fdInt))
-	}()
+	acknowledgeProtectedSocket(int64(fdInt))
 	return nil
 }
 

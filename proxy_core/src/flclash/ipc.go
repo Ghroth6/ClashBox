@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/constant"
@@ -46,6 +47,7 @@ func startIpcProxy(path string) {
 		conn, err := listener.Accept()
 		if err != nil {
 			log.Println("ipc_go Accept err:", err)
+			continue
 		}
 		go handleConnection(conn)
 	}
@@ -66,10 +68,21 @@ func handleConnection(conn net.Conn) {
 		log.Println("ipc_go error", err)
 		return
 	}
+	var responseMu sync.Mutex
+	streamReady := false
 	handleRemoteRequest(request, func(rr RpcResult) {
+		responseMu.Lock()
+		defer responseMu.Unlock()
+		if rr.Result == "tun-ready" {
+			streamReady = true
+		}
 		res, _ := json.Marshal(rr)
 		conn.Write([]byte(string(res) + "EOF"))
 	})
+	// Keep the protect response stream alive until the ArkTS owner closes it.
+	if request.Method == StartClash && streamReady {
+		_, _ = io.Copy(io.Discard, conn)
+	}
 }
 
 type RpcRequest struct {
@@ -256,13 +269,22 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		handleStopLog()
 		fn(ret)
 	case StartClash:
-		tunFd := anyToInt(request.Params[0])
-		log.Println("ipc_go", "tunFd", tunFd)
-		StartTUN(tunFd, func(fd Fd) {
-			res, _ := json.Marshal(fd)
-			ret.Result = string(res)
+		if len(request.Params) != 1 {
+			ret.Error = "startClash requires a TUN descriptor"
 			fn(ret)
+			return
+		}
+		tunFd := anyToInt(request.Params[0])
+		err := StartTUN(tunFd, func(fd Fd) {
+			res, _ := json.Marshal(fd)
+			fn(RpcResult{Key: request.Key, Method: request.Method, Result: string(res)})
 		})
+		if err != nil {
+			ret.Error = err.Error()
+		} else {
+			ret.Result = "tun-ready"
+		}
+		fn(ret)
 	case StopClash:
 		StopTun()
 		fn(ret)
@@ -319,12 +341,12 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		ret.Result = ""
 		fn(ret)
 	case HealthCheckBatch:
-	  paramsString, _ := request.Params[0].(string)
-	  handleAsyncTestDelayBatch(paramsString, func(value string) {
-	   ret.Result = value
-	   fn(ret)
-	  })
-	 case GetVersion:
+		paramsString, _ := request.Params[0].(string)
+		handleAsyncTestDelayBatch(paramsString, func(value string) {
+			ret.Result = value
+			fn(ret)
+		})
+	case GetVersion:
 		ver := constant.Version
 		if ver == "" {
 			ver = "Mihomo-release-v1.19.27"

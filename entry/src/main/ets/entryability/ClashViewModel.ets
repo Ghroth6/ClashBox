@@ -26,6 +26,7 @@ import { number2Time } from "../common/utils/TimeConvertUtil";
 import { picker } from "@kit.CoreFileKit"
 import { Xb_GetResourceString, Xb_ToastUtil } from "xb_components";
 import { accessControlRdb } from "../common/datasources/AccessControlRdb";
+import { requireAllowlist } from "proxy_core/src/main/ets/rpc/AllowlistPolicy";
 
 export interface DelayInfo{
     name: string
@@ -116,7 +117,7 @@ export class ClashViewModel {
         newProfile.loadContext(this.context)
         console.log(`配置${profile.name}基础设置完成`)
         try {
-          await newProfile.saveByUri(profile.url)
+          await newProfile.saveByUri(newProfile.url)
         } catch (err) {
           console.error(`ClashBox Restore 配置移动读取失败 ${err.name} ${err.message}`)
         }
@@ -404,16 +405,25 @@ export class ClashViewModel {
       params: params ?? {} as ConfigExtendedParams
     } as UpdateConfigParams)
     if (result != ""){
-      ClashViewModel.promptAction.showToast({message: result, duration: 3000 })
+      throw new Error(result)
     }
     EventHub.sendEvent(EventKey.FetchProxyGroup, null)
   }
   async ReStartVpn(){
     if(this.vpnStarted){
-      await this.loadConfig(false, 'ReStartVpn')
-      await this.loadVpnOptions()
-      await this.socketProxy.stopClash()
-      await this.socketProxy.startClash()
+      try {
+        await this.loadVpnOptions()
+        await this.socketProxy.stopClash()
+        this.vpnStarted = false
+        await this.loadConfig(false, 'ReStartVpn')
+        const started = await this.socketProxy.startClash()
+        if (!started) throw new Error('VPN 重新创建失败')
+        this.vpnStarted = true
+      } catch (e) {
+        this.vpnStarted = false
+        await this.socketProxy.stopClash()
+        throw e as Error
+      }
     }
   }
   vpnStarted = false
@@ -421,13 +431,16 @@ export class ClashViewModel {
   // 启动前要加载配置
   // loadConfig
   async StartVpn(){
-    this.vpnStarted = true
+    this.vpnStarted = false
+    await this.loadConfig(false, 'StartVpn')
     await this.loadVpnOptions()
     let result = await this.socketProxy.startClash()
     // 核心崩溃 小钥匙一直在，要重启两量变
     if (!result){
       result = await this.socketProxy.startClash()
     }
+    if (!result) throw new Error('VPN 创建失败')
+    this.vpnStarted = true
     if (result){
       EventHub.sendEvent(EventKey.StartedClash)
       EventHub.sendEvent(EventKey.checkIpInfo)
@@ -451,51 +464,20 @@ export class ClashViewModel {
     cardManager.pushCartProxyMode(this.vpnStarted)
   }
   async loadVpnOptions(){
-    // 使用首选项持久化单个节点信息供卡片拉起服务
-    let appConfig = AppStorage.get<AppConfig>("appConfig") || cardManager.getAppConfig()
-    let clashConfig = AppStorage.get<ClashConfig>("clashConfig") || cardManager.getClashConfig()
-    if (appConfig == null)
-      return
-    if (appConfig!.accessControl) {
-      // 从数据库加载白名单
-      const whiteApps = await accessControlRdb.getAppsByDomain('WHITE', 'name');
-      // 提取出处于“选中”状态的包名
-      let acceptList = whiteApps.filter(a => a.isSelected).map(a => a.package_name);
-      // 补充强制放行的包名
-      const protectedPackages = [
-        this.context?.applicationInfo.name as string,
-        'com.atomicservice.5765880207855877209'
-      ];
-      // 去重并加入保护列表
-      protectedPackages.forEach(pkg => {
-        if (pkg && !acceptList.includes(pkg)) {
-          acceptList.push(pkg);
-        }
-      });
-      // 从数据库加载黑名单
-      const blackApps = await accessControlRdb.getAppsByDomain('BLACK', 'name');
-      // 提取出处于“选中”状态的包名
-      const rejectList = blackApps.filter(a => a.isSelected).map(a => a.package_name);
-      console.log(`AccessControl 将加载 acceptList ${acceptList.length} 个，rejectList ${rejectList.length} 个`)
-      const accessControl = {
-        tunIp : clashConfig?.tun?.["tun-ip"],
-        // Capture IPv6 at the VPN layer even when Mihomo DNS/outbound IPv6 remains disabled.
-        ipv6: true,
-        routeAddress: clashConfig?.["route-address"] ?? [],
-        accessControl: { mode:appConfig?.accessControlMode ?? "", acceptList: acceptList, rejectList: rejectList } as AccessControl
-      } as VpnRawOptions
-      this.socketProxy.setOptionStates(accessControl)
-    } else {
-      const accessControl = {
-        tunIp : clashConfig?.tun?.["tun-ip"],
-        // Capture IPv6 at the VPN layer even when Mihomo DNS/outbound IPv6 remains disabled.
-        ipv6: true,
-        routeAddress: clashConfig?.["route-address"] ?? [],
-        accessControl: { mode:appConfig?.accessControlMode ?? "", acceptList: [], rejectList: [] } as AccessControl } as VpnRawOptions
-      this.socketProxy.setOptionStates(accessControl)
-    }
-    // 在日志控制台 过滤关键字 vpnConfig, 验证是否配置成功
-
+    const appConfig = AppStorage.get<AppConfig>("appConfig") || cardManager.getAppConfig();
+    if (appConfig == null) throw new Error('无法读取应用白名单设置，已拒绝启动 VPN');
+    const whiteApps = await accessControlRdb.getAppsByDomain('WHITE', 'name');
+    const packages = whiteApps.filter(a => a.isSelected).map(a => a.package_name);
+    const acceptList = requireAllowlist(appConfig.accessControl, appConfig.accessControlMode, packages);
+    // No implicit self/atomic-service additions. Outbound sockets use protect().
+    const options = {
+      tunIp: '172.19.0.1/30',
+      ipv6: true,
+      routeAddress: [],
+      accessControl: { mode: 'AcceptSelected', acceptList: acceptList, rejectList: [] } as AccessControl
+    } as VpnRawOptions;
+    const result = await this.socketProxy.setOptionStates(options);
+    if (result !== '' && result !== 'true') throw new Error('应用白名单未被内核确认');
   }
 
   async StopVpn(){
@@ -543,7 +525,8 @@ export class ClashViewModel {
       } as ConfigExtendedParams)
       console.log(`ClashViewModel.loadConfig 调用方：${name} patch：${patch} 配加载成功`)
     } catch (e) {
-      console.error('ClashViewModel.loadConfig 配置加载失败：', e)
+      console.error('ClashViewModel.loadConfig 配置加载失败')
+      throw e as Error
     }
   }
 

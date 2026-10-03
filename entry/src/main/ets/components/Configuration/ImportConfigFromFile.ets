@@ -134,6 +134,9 @@ export struct ImportConfigFromFile {
 
     // START
     Column({space: 10}) {
+      Text('原样导入模式：规则、DNS、策略组和 providers 以文件为准。含本地引用文件时请选择配置资源包；应用内覆写不生效。VPN 需要 dns.enable: true。')
+        .fontSize(14)
+        .fontColor($r('sys.color.font_secondary'))
       // 配置名input
       Text($r('app.string.config_name')).fontColor($r('sys.color.font_secondary')).fontSize(FONT_SIZE_16)
       TextInput(
@@ -323,4 +326,3 @@ export struct ImportConfigFromFile {
   }
 
 }
-

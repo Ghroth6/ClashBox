@@ -1,3 +1,4 @@
+import { requireAllowlist } from './AllowlistPolicy';
 import { vpnExtension, socket } from '@kit.NetworkKit';
 import {
   startTun, stopTun, setFdMap, getVpnOptions, startLog, getProxies, getTraffic,
@@ -81,6 +82,7 @@ export class FlClashVpnService extends CommonVpnService {
     return new Promise(async (resolve, reject) => {
       switch (code) {
         case ClashRpcType.startClash: {
+          this.ParseConfig() // Reject invalid scope before opening core listeners.
           startListener()
           this.startVpn().then((r) => {
             resolve(r)
@@ -147,13 +149,9 @@ export class FlClashVpnService extends CommonVpnService {
         vpnConfig.routes.push(route)
       }
     })
-    if (option.accessControl?.mode) {
-      if (option.accessControl?.mode == "AcceptSelected") {
-        vpnConfig.trustedApplications = option.accessControl?.acceptList
-      } else {
-        vpnConfig.blockedApplications = option.accessControl?.rejectList
-      }
-    }
+    const trusted = requireAllowlist(true, option.accessControl?.mode ?? '', option.accessControl?.acceptList ?? []);
+    vpnConfig.trustedApplications = trusted;
+    // Never attach blockedApplications together with trustedApplications.
     if (option.dnsServerAddress && option.dnsServerAddress != "") {
       vpnConfig.dnsAddresses = [option.dnsServerAddress]
     } else {
@@ -186,38 +184,73 @@ export class FlClashVpnService extends CommonVpnService {
     try {
       tunFd = await super.getTunFd(config)
       if (tunFd > -1) {
-        this.startClash(tunFd)
+        await this.startClash(tunFd)
       }
       return tunFd > -1;
     } catch (error) {
       console.error("ClashVPN  error ", error)
+      this.stopVpn()
+      stopListener()
       return false
     }
   }
 
-  startClash(tunFd: number) {
+  async startClash(tunFd: number): Promise<void> {
     this.clashSocket?.off('message')
     this.clashSocket?.close()
     let tcp: socket.LocalSocket = socket.constructLocalSocketInstance();
     this.clashSocket = tcp
-    tcp.on('message', (value: socket.LocalSocketMessageInfo) => {
-      let dd = this.textDecoder.decodeToString(new Uint8Array(value.message))
-      let list = dd.split("EOF")
-      for (let index = 0; index < list.length; index++) {
-        const element = list[index];
-        // 每个 fd 独立异步处理：Go 侧每个出站 socket 都等待 protect 完成（最长 5s），
-        // 串行 await 会让前一个 protect 阻塞后续 fd，后台 JS 线程受限时更易超时
-        // → socket 未保护 → 流量回环进 TUN → DNS 全断。
-        this.handleProtectMessage(element)
-      }
-    })
     const socketPath = this.context?.filesDir + '/clash_go.sock'
-    console.error("ClashVPN connect", tunFd)
-    tcp.connect({ address: { address: socketPath }, timeout: 1000 }).then(() => {
-      console.error("ClashVPN connect", tunFd)
-      tcp.send({ data: JSON.stringify({ method: ClashRpcType.startClash, params: [tunFd] }) });
-    }).catch((e: Error) => {
-      console.error("ClashVPN  error ", e.message, e)
+    await new Promise<void>((resolve, reject) => {
+      let pending = ''
+      let settled = false
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true
+          reject(new Error('等待原生 TUN 启动确认超时'))
+        }
+      }, 10000)
+      const fail = (error: Error) => {
+        if (!settled) {
+          settled = true
+          clearTimeout(timer)
+          reject(error)
+        }
+      }
+      tcp.on('message', (value: socket.LocalSocketMessageInfo) => {
+        pending += this.textDecoder.decodeToString(new Uint8Array(value.message))
+        if (pending.length > 65536) {
+          fail(new Error('原生 TUN 响应过长'))
+          return
+        }
+        let boundary = pending.indexOf('EOF')
+        while (boundary >= 0) {
+          const element = pending.substring(0, boundary)
+          pending = pending.substring(boundary + 3)
+          if (element !== '') {
+            try {
+              const result = JSON.parse(element) as RpcResult
+              if (result.error) {
+                fail(new Error(result.error))
+              } else if (result.result === 'tun-ready') {
+                if (!settled) {
+                  settled = true
+                  clearTimeout(timer)
+                  resolve()
+                }
+              } else {
+                this.handleProtectMessage(element)
+              }
+            } catch (error) {
+              fail(error as Error)
+            }
+          }
+          boundary = pending.indexOf('EOF')
+        }
+      })
+      tcp.connect({ address: { address: socketPath }, timeout: 1000 }).then(async () => {
+        await tcp.send({ data: JSON.stringify({ method: ClashRpcType.startClash, params: [tunFd] }) })
+      }).catch((error: Error) => fail(error))
     })
   }
 

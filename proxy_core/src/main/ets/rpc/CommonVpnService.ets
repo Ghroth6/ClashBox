@@ -1,3 +1,4 @@
+import { requireAllowlist } from './AllowlistPolicy';
 import { socket, vpnExtension } from "@kit.NetworkKit";
 import { common } from "@kit.AbilityKit";
 
@@ -34,8 +35,8 @@ export class VpnConfig {
   dnsAddresses: string[];
   isIPv4Accepted: boolean = true
   isIPv6Accepted: boolean = false
-  trustedApplications: string[] = []
-  blockedApplications: string[] = []
+  trustedApplications?: string[]
+  blockedApplications?: string[]
   constructor(
     tunIp: Address = new Address("172.19.0.1", 1),
     dnsAddresses: string[] = ["172.19.0.2"]
@@ -62,6 +63,12 @@ export abstract class CommonVpnService{
   abstract onRemoteMessageRequest(client: socket.LocalSocketConnection, message: socket.LocalSocketMessageInfo): Promise<void>
   abstract init()
   async getTunFd(config: VpnConfig): Promise<number> {
+    if (config.blockedApplications && config.blockedApplications.length > 0) {
+      throw new Error('本实验版不接受黑名单 VPN 配置');
+    }
+    config.trustedApplications = requireAllowlist(true, 'AcceptSelected', config.trustedApplications ?? []);
+    config.blockedApplications = undefined;
+
     let tunFd = -1
     try {
       this.vpnConnection = vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext);
@@ -133,4 +140,3 @@ export function cidrToRoute(cidr: string): RouteInfo | null {
     isDefaultRoute: cidr == "0.0.0.0/0" || cidr == "::/0",
   }
 }
-

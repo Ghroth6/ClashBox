@@ -124,7 +124,7 @@ export struct AccessControl {
           // 访问控制开关
           toggleRowList({
             title: $r('app.string.app_access_control'),
-            subtitle: $r('app.string.access_control_tips'),
+            subtitle: '本实验版只允许应用白名单；关闭、空名单或黑名单模式将拒绝启动。修改后需重启 VPN。',
             toggle: () => {
               this.controlBuilder()
             }

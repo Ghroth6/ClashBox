@@ -8,6 +8,7 @@ import { parse, stringify } from 'yaml'
 import { YamlUtils } from './utils/YamlUtils'
 import { YamlUtil } from './utils/YamlUtil';
 import { SocketProxyService } from './rpc/SocketProxyService';
+import { decodeProfileImport } from './ProfileImport';
 
 class  ConfigUserInfo {
   'content-disposition': string
@@ -103,7 +104,7 @@ export class Profile {
   }
 
   async update(socketProxy: SocketProxyService, customRules: string[] = [], deleteRules: string[] = []): Promise<boolean> {
-    console.debug(`[Profile] UpdateConfig this.url: ${this.url}`);
+    console.debug(`[Profile] UpdateConfig started`);
     const requestUa = this.globalUa ?? "clash-verge/v2.5.1";
     const tempYamlPath = this.context?.tempDir + "/temp.yaml";
 
@@ -329,25 +330,9 @@ export class Profile {
       rawStr = decoder.decodeToString(new Uint8Array(raw));
     }
 
-    const trimmedStr = rawStr.trim();
-    const isProbablyYaml = !( trimmedStr.startsWith('<!doctype') || trimmedStr.startsWith('<html') || trimmedStr.startsWith('<HTML') || (trimmedStr.startsWith('{') && trimmedStr.includes('"message"')) || trimmedStr.includes('<title>Just a moment...</title>'));
-
-    let finalStr: string;
-    if (isProbablyYaml) {
-      const plainRules: string[] = [];
-      for (const r of customRules) plainRules.push(r);
-      const rulesJsonStr = JSON.stringify(plainRules);
-
-      const plainDeleteRules: string[] = [];
-      for (const r of deleteRules) plainDeleteRules.push(r);
-      const deleteRulesJsonStr = JSON.stringify(plainDeleteRules);
-
-      const injectTask = new taskpool.Task(injectDnsInBackground, rawStr, rulesJsonStr, deleteRulesJsonStr, scriptContent, this.name ?? '', this.fixTlsFingerprint, this.yamlOverride);
-      finalStr = await taskpool.execute(injectTask) as string;
-    } else {
-      console.warn(`[Profile] save: 内容不像 YAML，跳过 DNS 注入，直接交给内核校验`);
-      finalStr = rawStr;
-    }
+    // Full-configuration mode: never inject DNS, rules, fingerprint fixes or scripts.
+    // The original YAML remains authoritative on import and subscription refresh.
+    const finalStr = rawStr;
 
     // 编码并写入临时文件
     let bytes = utf8e.encodeInto(finalStr);
@@ -375,37 +360,57 @@ export class Profile {
   }
 
   async saveByUri(uri: string, customRules: string[] = [], deleteRules: string[] = [], scriptContent: string = ""): Promise<Profile> {
-    const filePath = await getProfilePath(this.context, this.id)
+    const filePath = await getProfilePath(this.context, this.id);
+    const src = await fs.open(uri, fs.OpenMode.READ_ONLY);
+    let buffer: ArrayBuffer;
     try {
-      const srcFile = await fs.open(uri, fs.OpenMode.READ_ONLY);
-      const stat = await fs.stat(srcFile.fd);
-      const buffer = new ArrayBuffer(stat.size);
-      await fs.read(srcFile.fd, buffer);
-      await fs.close(srcFile.fd);
-
-      const decoder = util.TextDecoder.create('utf-8', { ignoreBOM: true });
-      let rawStr = decoder.decodeToString(new Uint8Array(buffer));
-
-      // 手动构建纯数组 + 序列化成字符串，规避 V2 Proxy 无法序列化问题
-      const plainRules: string[] = [];
-      for (const r of customRules) plainRules.push(r);
-      const rulesJsonStr = JSON.stringify(plainRules);
-
-      const plainDeleteRules: string[] = [];
-      for (const r of deleteRules) plainDeleteRules.push(r);
-      const deleteRulesJsonStr = JSON.stringify(plainDeleteRules);
-
-      const injectTask = new taskpool.Task(injectDnsInBackground, rawStr, rulesJsonStr, deleteRulesJsonStr, scriptContent, this.name ?? '', this.fixTlsFingerprint, this.yamlOverride);
-      rawStr = await taskpool.execute(injectTask) as string;
-
-      let bytes = utf8e.encodeInto(rawStr)
-      const destFile = await fs.open(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC)
-      await fs.write(destFile.fd, bytes.buffer)
-      await fs.close(destFile.fd)
-    } catch (error) {
-      throw error as Error
+      const stat = await fs.stat(src.fd);
+      if (stat.size <= 0 || stat.size > 32 * 1024 * 1024) throw new Error('配置大小无效');
+      buffer = new ArrayBuffer(stat.size);
+      let offset = 0;
+      while (offset < stat.size) {
+        const remaining = new ArrayBuffer(stat.size - offset);
+        const count = await fs.read(src.fd, remaining);
+        if (count <= 0) throw new Error('配置文件读取不完整');
+        new Uint8Array(buffer).set(new Uint8Array(remaining, 0, count), offset);
+        offset += count;
+      }
+    } finally {
+      await fs.close(src.fd);
     }
-    return this
+    const files = decodeProfileImport(new Uint8Array(buffer));
+    const directory = await getProfileDir(this.context, this.id);
+    const staging = directory + '.import-' + generateUUID();
+    const backup = directory + '.previous-' + generateUUID();
+    await fs.mkdir(staging);
+    let movedPrevious = false;
+    let committed = false;
+    try {
+      for (const item of files) {
+        const target = staging + '/' + item.path;
+        const parent = target.substring(0, target.lastIndexOf('/'));
+        if (!(await fs.access(parent))) await fs.mkdir(parent, true);
+        const file = await fs.open(target, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+        try {
+          const count = await fs.write(file.fd, item.bytes.buffer);
+          if (count !== item.bytes.length) throw new Error('配置资源写入不完整');
+          await fs.fsync(file.fd);
+        } finally {
+          await fs.close(file.fd);
+        }
+      }
+      // Swap the complete directory so a failed import cannot half-replace providers.
+      await fs.rename(directory, backup);
+      movedPrevious = true;
+      await fs.rename(staging, directory);
+      committed = true;
+    } finally {
+      if (!committed && movedPrevious) await fs.rename(backup, directory);
+      if (await fs.access(staging)) await fs.rmdir(staging);
+      // Keep a previous complete import for explicit recovery; no credentials are logged.
+    }
+    this.lastUpdateDate = new Date().getTime();
+    return this;
   }
 
   getSelectedProxyName(g: ProxyGroup): string | undefined {
@@ -450,109 +455,7 @@ export class Profile {
    * @returns 是否进行了修复
    */
   async repairMissingRules(customRules: string[] = [], deleteRules: string[] = []): Promise<boolean> {
-    const filePath = await getProfilePath(this.context, this.id);
-    if (!await fs.access(filePath)) {
-      return false;
-    }
-
-    try {
-      const file = await fs.open(filePath, fs.OpenMode.READ_ONLY);
-      const stat = await fs.stat(file.fd);
-      const buffer = new ArrayBuffer(stat.size);
-      await fs.read(file.fd, buffer);
-      await fs.close(file.fd);
-
-      const decoder = util.TextDecoder.create('utf-8', { ignoreBOM: true });
-      let rawStr = decoder.decodeToString(new Uint8Array(buffer));
-
-      // 不再写死强制 AND 规则存在：
-      // 之前硬编码会让"用户关闭 AND 后，后续修复仍把它当缺失重新注入"，
-      // 反复修复破坏配置导致无法加载。AND 规则已作为普通附加规则，
-      // 由 customRules(启用)/deleteRules(禁用) 驱动，无需在此强制。
-      const fixedRules: string[] = [];
-
-      const plainRules: string[] = [];
-      for (const r of customRules) plainRules.push(r);
-      const rulesJsonStr = JSON.stringify(plainRules);
-
-      const plainDeleteRules: string[] = [];
-      for (const r of deleteRules) plainDeleteRules.push(r);
-      const deleteRulesJsonStr = JSON.stringify(plainDeleteRules);
-
-      const allRequiredRules = [...fixedRules, ...plainRules];
-      let needsRepair = false;
-
-      // 转义正则特殊字符的辅助函数
-      const escapeRegExp = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-      // ★ 规范化: 去除全部空白, 使规则前后空格/逗号后空格均视为同一条规则
-      // (如 DOMAIN-SUFFIX,mihoyo.com,DIRECT / DOMAIN-SUFFIX, mihoyo.com, DIRECT 等价)
-      const normalizedRaw = rawStr.replace(/\s+/g, '');
-      const normalizeRule = (s: string): string => s.replace(/\s+/g, '');
-
-      // 检查是否有缺失的规则
-      for (const rule of allRequiredRules) {
-        if (rule.endsWith(',MATCH')) {
-          // 如果规则是 xxx,MATCH，检查文件里是否有 xxx,xxx (排除本身还是 MATCH 的情况)
-          const prefix = normalizeRule(rule.substring(0, rule.length - 6));
-          const regex = new RegExp(escapeRegExp(prefix) + ',(?!MATCH\\b)');
-          if (!regex.test(normalizedRaw)) {
-            needsRepair = true;
-            console.info(`ProfileRepair: 配置 [${this.name}] 缺失规则前缀${prefix} (MATCH)`);
-            break;
-          }
-        } else {
-          // ★ 去除全部空白后比较: 内容一致(前后/逗号后空格均可)视为同一条规则, 避免重复注入/误判
-          if (!normalizedRaw.includes(normalizeRule(rule))) {
-            needsRepair = true;
-            console.info(`ProfileRepair: 配置 [${this.name}] 缺失规则${rule}`);
-            break;
-          }
-        }
-      }
-
-      // 如果没有缺失，再检查是否包含需要删除的规则
-      if (!needsRepair && plainDeleteRules.length > 0) {
-        for (const rule of plainDeleteRules) {
-          if (rule.endsWith(',MATCH')) {
-            const prefix = normalizeRule(rule.substring(0, rule.length - 6));
-            // 检查文件里是否存在该前缀的规则
-            const regex = new RegExp(escapeRegExp(prefix) + ',');
-            if (regex.test(normalizedRaw)) {
-              needsRepair = true;
-              console.info(`ProfileRepair: 配置 [${this.name}] 包含需删除的残留规则前缀${prefix} (MATCH)`);
-              break;
-            }
-          } else {
-            // ★ 去除全部空白后比较: 内容一致(前后/逗号后空格均可)视为同一条规则, 避免误删
-            if (normalizedRaw.includes(normalizeRule(rule))) {
-              needsRepair = true;
-              console.info(`ProfileRepair: 配置 [${this.name}] 包含需删除的残留规则${rule}`);
-              break;
-            }
-          }
-        }
-      }
-
-      if (needsRepair) {
-        console.info(`ProfileRepair: 开始修复配置 [${this.name}]`);
-        const injectTask = new taskpool.Task(injectDnsInBackground, rawStr, rulesJsonStr, deleteRulesJsonStr, '', this.name || '', this.fixTlsFingerprint, this.yamlOverride);
-        const repairedStr = await taskpool.execute(injectTask) as string;
-
-        const utf8e = new util.TextEncoder();
-        let bytes = utf8e.encodeInto(repairedStr);
-
-        const destFile = await fs.open(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-        await fs.write(destFile.fd, bytes.buffer);
-        await fs.close(destFile.fd);
-
-        return true;
-      }
-      return false;
-    } catch (e) {
-      console.error(`ProfileRepair: 修复配置 [${this.name}] 失败`, e);
-      return false;
-    }
+    return false; // Original configuration is authoritative.
   }
 
   /**
@@ -564,36 +467,7 @@ export class Profile {
    * @returns 是否写盘成功
    */
   async forceRewriteRules(customRules: string[] = [], deleteRules: string[] = []): Promise<boolean> {
-    const filePath = await getProfilePath(this.context, this.id);
-    if (!await fs.access(filePath)) {
-      return false;
-    }
-    try {
-      const file = await fs.open(filePath, fs.OpenMode.READ_ONLY);
-      const stat = await fs.stat(file.fd);
-      const buffer = new ArrayBuffer(stat.size);
-      await fs.read(file.fd, buffer);
-      await fs.close(file.fd);
-
-      const decoder = util.TextDecoder.create('utf-8', { ignoreBOM: true });
-      const rawStr = decoder.decodeToString(new Uint8Array(buffer));
-
-      const rulesJsonStr = JSON.stringify(customRules);
-      const deleteRulesJsonStr = JSON.stringify(deleteRules);
-      const injectTask = new taskpool.Task(injectDnsInBackground, rawStr, rulesJsonStr, deleteRulesJsonStr, '', this.name || '', this.fixTlsFingerprint, this.yamlOverride);
-      const injectedStr = await taskpool.execute(injectTask) as string;
-
-      const utf8e = new util.TextEncoder();
-      const bytes = utf8e.encodeInto(injectedStr);
-      const destFile = await fs.open(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-      await fs.write(destFile.fd, bytes.buffer);
-      await fs.close(destFile.fd);
-      console.info(`ProfileRepair: 强制重写规则完成 [${this.name}] 规则数: ${customRules.length}`);
-      return true;
-    } catch (e) {
-      console.error(`ProfileRepair: 强制重写规则失败 [${this.name}]`, e);
-      return false;
-    }
+    throw new Error('原样导入模式不执行规则、DNS或脚本覆写；请编辑源配置后重新导入');
   }
 
   /**
@@ -603,35 +477,7 @@ export class Profile {
    * @returns 是否进行了注入写回
    */
   async ensureProvidersLazy(): Promise<boolean> {
-    const filePath = await getProfilePath(this.context, this.id);
-    if (!await fs.access(filePath)) {
-      return false;
-    }
-    try {
-      const file = await fs.open(filePath, fs.OpenMode.READ_ONLY);
-      const stat = await fs.stat(file.fd);
-      const buffer = new ArrayBuffer(stat.size);
-      await fs.read(file.fd, buffer);
-      await fs.close(file.fd);
-
-      const decoder = util.TextDecoder.create('utf-8', { ignoreBOM: true });
-      const rawStr = decoder.decodeToString(new Uint8Array(buffer));
-
-      const injectedStr = YamlUtils.injectProvidersLazy(rawStr);
-      if (injectedStr === rawStr) {
-        return false; // 无 proxy-providers 或已全部 lazy, 无需写盘
-      }
-
-      const destFile = await fs.open(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-      const bytes = utf8e.encodeInto(injectedStr);
-      await fs.write(destFile.fd, bytes.buffer);
-      await fs.close(destFile.fd);
-      console.info(`Profile [${this.name}] proxy-providers 已注入 lazy: true`);
-      return true;
-    } catch (e) {
-      console.warn(`Profile [${this.name}] ensureProvidersLazy 失败`, e);
-      return false;
-    }
+    return false; // Original configuration is authoritative.
   }
 
   /**
@@ -649,72 +495,7 @@ export class Profile {
     deleteRules: string[] = [],
     yamlOverride: string = ""
   ): Promise<boolean> {
-    const filePath = await getProfilePath(this.context, this.id);
-    // YAML 覆写参数同步到实例字段, 供后台注入链统一应用
-    this.yamlOverride = yamlOverride;
-    console.info(`[ScriptTest] Profile.reapplyScript 读取文件: ${filePath}`);
-
-    if (!await fs.access(filePath)) {
-      console.warn(`[ScriptTest] 文件不存在，跳过: ${filePath}`);
-      return false;
-    }
-    try {
-      const file = await fs.open(filePath, fs.OpenMode.READ_ONLY);
-      const stat = await fs.stat(file.fd);
-      const buffer = new ArrayBuffer(stat.size);
-      await fs.read(file.fd, buffer);
-      await fs.close(file.fd);
-
-      const decoder = util.TextDecoder.create('utf-8', { ignoreBOM: true });
-      const rawStr = decoder.decodeToString(new Uint8Array(buffer));
-      console.info(`[ScriptTest] 原始 YAML 内容读取成功，长度: ${rawStr.length}`);
-
-      // 校验和落盘逻辑分离，先判断是否被修改
-      const plainRules: string[] = [];
-      for (const r of customRules) plainRules.push(r);
-      const rulesJsonStr = JSON.stringify(plainRules);
-      const plainDeleteRules: string[] = [];
-      for (const r of deleteRules) plainDeleteRules.push(r);
-      const deleteRulesJsonStr = JSON.stringify(plainDeleteRules);
-
-      // 在后台线程执行脚本和注入
-      const injectTask = new taskpool.Task(injectDnsInBackground, rawStr, rulesJsonStr, deleteRulesJsonStr, scriptContent, this.name ?? '', this.fixTlsFingerprint, this.yamlOverride);
-      let finalStr = await taskpool.execute(injectTask) as string;
-
-      // 如果脚本没修改配置，finalStr 和 rawStr 相同，直接返回成功，不备份不落盘
-      if (finalStr === rawStr) {
-        console.info(`[ScriptTest] 脚本未影响此配置 [${this.name}]，跳过保存`);
-        return true;
-      }
-
-      // 执行到此，说明配置已被脚本修改，此时备份原始纯净配置
-      await this.saveScriptBackup(rawStr);
-
-      // 校验并落盘
-      try {
-        let bytes = utf8e.encodeInto(finalStr);
-        const tempPath = this.context!.tempDir + "/temp.config";
-        const temp = await fs.open(tempPath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-        await fs.write(temp.fd, bytes.buffer);
-        await fs.close(temp.fd);
-        let message = await vailConfig(tempPath);
-        await fs.unlink(tempPath);
-        if (message != "") throw new Error(message);
-
-        const filePath = await getProfilePath(this.context, this.id);
-        const file = await fs.open(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-        await fs.write(file.fd, bytes.buffer);
-        await fs.close(file.fd);
-        console.info(`[ScriptTest] 脚本修改已保存: [${this.name}]`);
-        return true;
-      } catch (e) {
-        console.error(`[ScriptTest] 脚本执行后校验失败:`, e);
-        return false;
-      }
-    } catch (e) {
-      console.error(`[ScriptTest] 配置变更失败:`, e);
-      return false;
-    }
+    throw new Error('原样导入模式不执行规则、DNS或脚本覆写；请编辑源配置后重新导入');
   }
 
   // 获取脚本备份文件的专属路径 (与 config.yaml 同目录)

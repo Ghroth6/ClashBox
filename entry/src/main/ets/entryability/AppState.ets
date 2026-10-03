@@ -42,7 +42,7 @@ export class AppConfig {
   currentProxyName?: string
   currentProfileName?: string
   currentProxyItem?: ProxyItem
-  accessControlMode: string = 'RejectSelected'
+  accessControlMode: string = 'AcceptSelected'
   accessControlSort: 'name' | 'time' = 'name'
   accessControlAppInfo: string = JSON.stringify([])
   accessControlAcceptList: string = JSON.stringify([])
@@ -53,7 +53,7 @@ export class AppConfig {
   enableLogger: boolean = false
   enableRequest: boolean = false
   enableConnect: boolean = false
-  accessControl: boolean = false
+  accessControl: boolean = true
   testUrl: string = "https://www.gstatic.com/generate204"
   clashCore: ClashCore = ClashCore.ClashMeta
   switchMode: ProxyMode = ProxyMode.Rule
