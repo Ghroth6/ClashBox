@@ -31,3 +31,6 @@ profiler
 
 # Generated from the pinned native sources; delivered separately as a release asset.
 /proxy_core/libs/arm64-v8a/libflclash.so
+
+# Repository-owned machine data, evidence and generated files.
+/local/
