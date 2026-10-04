@@ -3,5 +3,3 @@
 package main
 
 const systemOwnsTUN = false
-
-func systemTUNReadyLocked() bool { return true }

@@ -163,8 +163,8 @@ export class FlClashVpnService extends CommonVpnService {
     this.isStopped = false
     const generation = ++this.startGeneration
     try {
-      const nativeToken = getTunStartToken()
       const config = this.ParseConfig()
+      const nativeToken = getTunStartToken()
       await this.networkMonitor.start()
       if (generation !== this.startGeneration) return false
       const tunFd = await super.getTunFd(config)
