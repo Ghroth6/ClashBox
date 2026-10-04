@@ -68,7 +68,7 @@ func handleStartListener() bool {
 	}
 	startCoreEvents()
 	isRunning = true
-	if err := updateListeners(true); err != nil {
+	if err := updateListeners(); err != nil {
 		isRunning = false
 		log.Errorln("Start proxy listeners: %s", err)
 		return false
@@ -77,10 +77,10 @@ func handleStartListener() bool {
 }
 
 func handleStopListener() bool {
+	compat.CancelForwarding()
 	runLock.Lock()
 	defer runLock.Unlock()
 	isRunning = false
-	stopCoreEvents()
 	if err := stopListeners(); err != nil {
 		return false
 	}
@@ -99,6 +99,7 @@ func handleForceGc() {
 }
 
 func handleShutdown() bool {
+	compat.CancelForwarding()
 	runLock.Lock()
 	defer runLock.Unlock()
 	isRunning = false

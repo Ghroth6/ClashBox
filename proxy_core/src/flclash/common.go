@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/provider"
@@ -37,6 +38,9 @@ var (
 
 func init() {
 	compat.ConfigureEmbeddedController()
+	if err := compat.ConfigureForwarding(); err != nil {
+		panic(err)
+	}
 }
 
 type ExternalProviders []ExternalProvider
@@ -224,16 +228,14 @@ func patchConfig() {
 	})
 }
 
-func updateListeners(force bool) (err error) {
+func updateListeners() (err error) {
 	if !isRunning || currentConfig == nil {
 		return nil
 	}
 	defer func() {
 		if err != nil {
 			isRunning = false
-			stopCoreEvents()
 			err = errors.Join(err, stopListeners())
-			handleCloseConnectionsUnLock()
 		}
 	}()
 	if !systemTUNReadyLocked() {
@@ -243,12 +245,12 @@ func updateListeners(force bool) (err error) {
 	if err != nil {
 		return err
 	}
-	if force {
-		if err = stopListeners(); err != nil {
-			return err
-		}
+	if systemOwnsTUN {
+		err = compat.StartPreparedForwarding(runtime)
+	} else {
+		err = compat.StartForwarding(context.Background(), runtime)
 	}
-	if err = compat.StartProxyListeners(runtime); err != nil {
+	if err != nil {
 		return err
 	}
 	if !systemOwnsTUN {
@@ -258,9 +260,11 @@ func updateListeners(force bool) (err error) {
 }
 
 func stopListeners() error {
-	err := compat.StopProxyListeners()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := compat.StopForwarding(ctx)
 	if err != nil {
-		log.Errorln("Stop proxy listeners: %s", err)
+		log.Errorln("Stop forwarding: %s", err)
 	}
 	if !systemOwnsTUN {
 		listener.ReCreateTun(LC.Tun{}, tunnel.Tunnel)
@@ -292,6 +296,14 @@ func applyConfig(rawConfig *config.RawConfig) error {
 	if err != nil {
 		return err // Keep the previous config; never apply a broad default on failure.
 	}
+	if isRunning || systemTUNActiveLocked() {
+		return errors.New("stop the system VPN before replacing its configuration")
+	}
+	if err := stopListeners(); err != nil {
+		isRunning = false
+		return fmt.Errorf("stop forwarding before config replacement: %w", err)
+	}
+	isRunning = false
 	if !configParams.IsPatch {
 		eventIDs.Store(compat.NewEventIDs(nextConfig.Proxies, nextConfig.Providers))
 	}
@@ -309,5 +321,5 @@ func applyConfig(rawConfig *config.RawConfig) error {
 			return err
 		}
 	}
-	return updateListeners(false)
+	return updateListeners()
 }

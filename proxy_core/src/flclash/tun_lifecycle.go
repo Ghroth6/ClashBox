@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strconv"
 	"sync"
 )
@@ -11,7 +12,9 @@ import (
 type tunSession struct {
 	lifecycle  *tunLifecycle
 	generation uint64
-	done       chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       <-chan struct{}
 	request    func(Fd)
 }
 
@@ -45,9 +48,10 @@ func (l *tunLifecycle) Generation() uint64 {
 func (l *tunLifecycle) NewSession(generation uint64) *tunSession {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	s := &tunSession{lifecycle: l, generation: generation, done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &tunSession{lifecycle: l, generation: generation, ctx: ctx, cancel: cancel, done: ctx.Done()}
 	if generation != l.generation {
-		close(s.done)
+		cancel()
 		return s
 	}
 	if l.sessions == nil {
@@ -113,7 +117,7 @@ func (l *tunLifecycle) cancelLocked(s *tunSession) {
 	}
 	if _, ok := l.sessions[s]; ok {
 		delete(l.sessions, s)
-		close(s.done)
+		s.cancel()
 	}
 	if l.current == s {
 		l.current = nil

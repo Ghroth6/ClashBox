@@ -13,6 +13,6 @@ func (l *Listener) Close() error {
 
 var StartFn func(int, string, string, []string) (*Listener, error)
 
-func Start(fd int, device, stack string, dns []string) (*Listener, error) {
+func Start(fd int, device, stack string, dns []string, target any) (*Listener, error) {
 	return StartFn(fd, device, stack, dns)
 }

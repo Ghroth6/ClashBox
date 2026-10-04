@@ -12,7 +12,6 @@ import (
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/sing_tun"
 	"github.com/metacubex/mihomo/log"
-	"github.com/metacubex/mihomo/tunnel"
 )
 
 type Props struct {
@@ -25,7 +24,7 @@ type Props struct {
 	Dns6     string `json:"dns6"`
 }
 
-func Start(fd int, device string, stack constant.TUNStack, dnsHijack []string) (*sing_tun.Listener, error) {
+func Start(fd int, device string, stack constant.TUNStack, dnsHijack []string, target constant.Tunnel) (*sing_tun.Listener, error) {
 	var prefix4 []netip.Prefix
 	inet4Prefix4, err := netip.ParsePrefix(state.CurrentState.TunIp)
 	if err == nil {
@@ -66,7 +65,7 @@ func Start(fd int, device string, stack constant.TUNStack, dnsHijack []string) (
 		FileDescriptor:      fd,
 	}
 
-	listener, err := sing_tun.New(options, tunnel.Tunnel)
+	listener, err := sing_tun.New(options, target)
 
 	if err != nil {
 		log.Errorln("startTUN error:", err)

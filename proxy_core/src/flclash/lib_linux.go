@@ -38,7 +38,7 @@ var (
 	// TUN constructors/Close do not expose a reliable retry contract. Keep an
 	// uncertain result sticky instead of closing a possibly recycled fd again.
 	tunCleanupErr      error
-	listenerCleanupErr error // StopProxyListeners retains failed objects for retry.
+	listenerCleanupErr error // Forwarding Stop retains failed resources for retry.
 	protectionOwner    atomic.Pointer[tunSession]
 	counter            int64 = 0
 	processMap         ProcessMap
@@ -80,9 +80,15 @@ func StartTUN(fd int, owner *tunSession, markSocket func(Fd)) error {
 	}
 	tunOwner = owner
 	protectionOwner.Store(owner)
+	target, err := compat.PrepareForwarding(owner.ctx)
+	if err != nil {
+		tunSessions.Cancel(owner)
+		protectionOwner.CompareAndSwap(owner, nil)
+		return fmt.Errorf("prepare forwarding: %w", err)
+	}
 	options := currentConfig.General.Tun
 	options.DNSHijack = append([]string(nil), options.DNSHijack...)
-	listener, err := t.Start(fd, options.Device, options.Stack, options.DNSHijack)
+	listener, err := t.Start(fd, options.Device, options.Stack, options.DNSHijack, target)
 	if err != nil {
 		tunSessions.Cancel(owner)
 		protectionOwner.CompareAndSwap(owner, nil)
@@ -131,12 +137,17 @@ func startKeepalive() {
 					if string(currentConfig.General.Mode) == "direct" {
 						return
 					}
-					if compat.ConnectionCount(statistic.DefaultManager.Snapshot()) > 0 {
-						go handleHealthCheckAll()
-					}
-					// 关闭所有空闲连接，强制 NAT 重新建立映射
+					// The keepalive policy applies only to this forwarding run.
+					// Management/internal requests must not be closed by this scan.
+					generation := compat.ForwardingGeneration()
+					active := false
 					n := 0
 					statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
+						metadata := c.Info().Metadata
+						if generation == 0 || metadata == nil || metadata.ForwardingGeneration != generation {
+							return true
+						}
+						active = true
 						// 仅关闭已空闲超过 120s 的连接
 						if time.Since(c.LastActivity()) > 120*time.Second {
 							_ = c.Close()
@@ -144,6 +155,9 @@ func startKeepalive() {
 						}
 						return true
 					})
+					if active {
+						go handleHealthCheckAll()
+					}
 					if n > 0 {
 						log.Infoln("[Keepalive] 已关闭 %d 个空闲连接", n)
 					}
@@ -189,6 +203,7 @@ func StopTun() error {
 	// Invalidate requests captured before Stop, even when their handler has not
 	// reached StartTUN yet. This also releases pending protect waits immediately.
 	tunSessions.CancelAll()
+	compat.CancelForwarding()
 	runLock.Lock()
 	defer runLock.Unlock()
 	tunSessions.Cancel(tunOwner)
@@ -209,13 +224,10 @@ func StopTunOwner(owner *tunSession) error {
 func stopTunLocked() error {
 	protectionOwner.CompareAndSwap(tunOwner, nil)
 	stopKeepalive()
-	stopCoreEvents()
 	isRunning = false
 	listenerCleanupErr = stopListeners()
-	handleCloseConnectionsUnLock()
 	runTime = nil
 	tunErr := closeTunLocked()
-	compat.FlushDNS()
 	err := errors.Join(listenerCleanupErr, tunErr)
 	if err == nil {
 		tunOwner = nil

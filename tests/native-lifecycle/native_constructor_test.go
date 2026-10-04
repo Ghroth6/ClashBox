@@ -1,6 +1,7 @@
 package main
 
 import (
+	"core/compat"
 	t "core/tun"
 	"encoding/json"
 	"errors"
@@ -34,11 +35,12 @@ type nativeConfig struct {
 }
 
 var stopListenersFn func() error
+var stoppedCoreEvents, closedAllConnections int
 
 func startKeepalive()               {}
 func stopKeepalive()                {}
-func stopCoreEvents()               {}
-func handleCloseConnectionsUnLock() {}
+func stopCoreEvents()               { stoppedCoreEvents++ }
+func handleCloseConnectionsUnLock() { closedAllConnections++ }
 
 func stopListeners() error {
 	if stopListenersFn != nil {
@@ -60,6 +62,8 @@ func resetNativeTestState() {
 	isRunning = false
 	currentConfig = &nativeConfig{}
 	stopListenersFn = nil
+	stoppedCoreEvents, closedAllConnections = 0, 0
+	compat.CancelForwardingFn = nil
 	t.StartFn = nil
 }
 
@@ -78,6 +82,34 @@ type observedWriteConn struct {
 	net.Conn
 	writeEntered chan struct{}
 	once         sync.Once
+}
+
+func TestNativeStopPreservesManagementAndCancelsForwardingBeforeCleanup(tst *testing.T) {
+	prepareNativeTest(tst)
+	owner := tunSessions.NewSession(tunSessions.Generation())
+	t.StartFn = func(int, string, string, []string) (*t.Listener, error) { return &t.Listener{}, nil }
+	if err := StartTUN(42, owner, func(Fd) {}); err != nil {
+		tst.Fatal(err)
+	}
+	cancelled := false
+	compat.CancelForwardingFn = func() {
+		cancelled = true
+		if owner.ctx.Err() == nil {
+			tst.Error("native owner context is still active")
+		}
+	}
+	stopListenersFn = func() error {
+		if !cancelled {
+			tst.Error("forwarding cleanup began before cancellation")
+		}
+		return nil
+	}
+	if err := StopTun(); err != nil {
+		tst.Fatal(err)
+	}
+	if stoppedCoreEvents != 0 || closedAllConnections != 0 {
+		tst.Fatal("forwarding Stop cancelled management events or globally closed connections")
+	}
 }
 
 func (c *observedWriteConn) Write(data []byte) (int, error) {

@@ -53,6 +53,11 @@ func startCoreEvents() {
 			if !active() {
 				return
 			}
+			metadata := tracker.Info().Metadata
+			if metadata != nil && metadata.ForwardingGeneration != 0 &&
+				metadata.ForwardingGeneration != compat.ForwardingGeneration() {
+				return
+			}
 			requestHistory.Add(tracker.Info())
 			sendMessage(Message{Type: RequestMessage, Data: tracker.Info()})
 		}),

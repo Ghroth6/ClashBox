@@ -73,18 +73,46 @@ function viewHarness() {
     ${slice(viewFile, '  private async startVpnWithIntent(')}
     ${slice(viewFile, '  async StopVpn(')}
     ${slice(viewFile, '  private async stopVpnWithResult(')}
+    ${slice(viewFile, '  private async ensureCoreEvents(')}
+    ${slice(viewFile, '  private cancelCoreEvents(')}
   }\nnew View()`, {
     EventHub: { sendEvent: event => events.push(event), on: () => {} },
-    EventKey: { StartedClash: 'started', StopedClash: 'stopped', StopedClashEntry: 'stopped-entry', checkIpInfo: 'ip' },
+    EventKey: { StartedClash: 'started', StopedClash: 'stopped', StopedClashEntry: 'stopped-entry', checkIpInfo: 'ip', TestDelay: 'delay', FetchProxyGroup: 'loaded' },
     cardManager: { pushCartProxyMode: value => cards.push(value), pushCartVpnServiceTime: () => {} },
     hilog: { info: () => {} }, PROXY_STARTED_DURATION_INIT_VALUE: '00:00', number2Time: String,
   });
   h.socketProxy = { lastVpnOperation: undefined, startClash: async () => true, stopClash: async () => true };
   h.loadConfig = async () => {}; h.loadVpnOptions = async () => {}; h.getRuntime = async () => 123;
-  h.cancelCoreEvents = () => events.push('unsubscribe');
+  h.coreEventsGeneration = 0; h.delayMap = new Map();
   h.proxyStartedTimer = { start: () => {}, reset: () => events.push('timer-reset') };
   return { h, events, cards };
 }
+
+test('forwarding stop retains management events, while service replacement cancels the old stream', async () => {
+  const { h, events } = viewHarness(); let callback, unsubscribed = 0;
+  h.socketProxy.registerMessage = async observer => { callback = observer; return () => { unsubscribed++; }; };
+  await h.ensureCoreEvents();
+  await h.StopVpn();
+  callback(JSON.stringify({type: 'delay', data: {name: 'proxy', value: 42}}));
+  callback(JSON.stringify({type: 'loaded', data: {success: false, name: 'provider', error: 'network unavailable'}}));
+  assert.equal(unsubscribed, 0); assert.equal(h.delayMap.get('proxy').delay, 42);
+  assert.ok(events.includes('delay')); assert.ok(events.includes('loaded'));
+  h.cancelCoreEvents();
+  const before = events.length;
+  callback(JSON.stringify({type: 'loaded', data: {success: true}}));
+  assert.equal(events.length, before); assert.equal(unsubscribed, 1);
+});
+
+test('configuration replacement while running uses acknowledged restart and cannot bypass failed cleanup', async () => {
+  const method = slice(viewFile, '  async loadConfig(');
+  const h = compile(`class View { ${method} }\nnew View()`);
+  let restarts = 0;
+  h.vpnStarted = true;
+  h.ReStartVpn = async () => { restarts++; throw new Error('destroy failed'); };
+  await assert.rejects(h.loadConfig(false), /destroy failed/); assert.equal(restarts, 1);
+  h.vpnCleanupRequired = true;
+  await assert.rejects(h.loadConfig(false), /清理尚未完成/); assert.equal(restarts, 1);
+});
 test('stop has no success effects before acknowledgement, and failure retains cleanup intent for retry', async () => {
   const { h, events, cards } = viewHarness(), stop = deferred();
   h.vpnStarted = true; h.vpnDesiredRunning = true;

@@ -603,7 +603,8 @@ export class ClashViewModel {
     const stopped = await this.socketProxy.stopClash()
     if (!stopped) throw new Error('VPN 停止未确认')
     this.vpnCleanupRequired = false
-    this.cancelCoreEvents()
+    // Provider and delay results belong to the management service, which stays
+    // alive while forwarding is stopped. ChangeCore still replaces this stream.
     this.vpnStarted = false
     // Index里的停止后操作
     EventHub.sendEvent(EventKey.StopedClash)
@@ -634,6 +635,16 @@ export class ClashViewModel {
   proxyGroups :ProxyGroup[] = []
 
   async loadConfig(patch: boolean = true, name?: string) {
+    if (this.vpnStopPending || this.vpnCleanupRequired) {
+      throw new Error('VPN 清理尚未完成，不能替换运行配置')
+    }
+    if (this.vpnStarted) {
+      if (this.vpnStartPending) throw new Error('VPN 启动仍在完成，请稍后重试配置加载')
+      // TUN and listener objects are bound to one forwarding generation. A
+      // config replacement therefore uses the same acknowledged stop/start path.
+      await this.ReStartVpn()
+      return
+    }
     console.error(`ClashViewModel.loadConfig 调用方：${name} patch：${patch} 配置开始加载`)
     let appConfig = AppStorage.get<AppConfig>("appConfig") || cardManager.getAppConfig()
     let clashConfig = AppStorage.get<ClashConfig>("clashConfig") || cardManager.getClashConfig()

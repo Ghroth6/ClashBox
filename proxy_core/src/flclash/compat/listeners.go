@@ -60,6 +60,12 @@ func FreshProxyListeners(cfg *config.Config, raw []map[string]any) (*config.Conf
 // serializes this with config application and StopProxyListeners. Any actual
 // bind failure closes the complete proxy ingress set before returning an error.
 func StartProxyListeners(cfg *config.Config) error {
+	return StartProxyListenersWithTunnel(cfg, tunnel.Tunnel)
+}
+
+// A managed caller supplies a tunnel bound to the prepared forwarding owner,
+// so a delayed handshake cannot join whichever run happens to be current later.
+func StartProxyListenersWithTunnel(cfg *config.Config, target C.Tunnel) error {
 	g := cfg.General
 	listener.SetAllowLan(g.AllowLan)
 	inbound.SetSkipAuthPrefixes(g.SkipAuthPrefixes)
@@ -70,16 +76,16 @@ func StartProxyListeners(cfg *config.Config) error {
 		name  string
 		start func() error
 	}{
-		{"named", func() error { return listener.PatchInboundListeners(cfg.Listeners, tunnel.Tunnel, true) }},
-		{"http", func() error { return listener.ReCreateHTTP(g.Port, tunnel.Tunnel) }},
-		{"socks", func() error { return listener.ReCreateSocks(g.SocksPort, tunnel.Tunnel) }},
-		{"redir", func() error { return listener.ReCreateRedir(g.RedirPort, tunnel.Tunnel) }},
-		{"tproxy", func() error { return listener.ReCreateTProxy(g.TProxyPort, tunnel.Tunnel) }},
-		{"mixed", func() error { return listener.ReCreateMixed(g.MixedPort, tunnel.Tunnel) }},
-		{"shadowsocks", func() error { return listener.ReCreateShadowSocks(g.ShadowSocksConfig, tunnel.Tunnel) }},
-		{"vmess", func() error { return listener.ReCreateVmess(g.VmessConfig, tunnel.Tunnel) }},
-		{"tuic", func() error { return listener.ReCreateTuic(g.TuicServer, tunnel.Tunnel) }},
-		{"tunnels", func() error { return listener.PatchTunnel(cfg.Tunnels, tunnel.Tunnel) }},
+		{"named", func() error { return listener.PatchInboundListeners(cfg.Listeners, target, true) }},
+		{"http", func() error { return listener.ReCreateHTTP(g.Port, target) }},
+		{"socks", func() error { return listener.ReCreateSocks(g.SocksPort, target) }},
+		{"redir", func() error { return listener.ReCreateRedir(g.RedirPort, target) }},
+		{"tproxy", func() error { return listener.ReCreateTProxy(g.TProxyPort, target) }},
+		{"mixed", func() error { return listener.ReCreateMixed(g.MixedPort, target) }},
+		{"shadowsocks", func() error { return listener.ReCreateShadowSocks(g.ShadowSocksConfig, target) }},
+		{"vmess", func() error { return listener.ReCreateVmess(g.VmessConfig, target) }},
+		{"tuic", func() error { return listener.ReCreateTuic(g.TuicServer, target) }},
+		{"tunnels", func() error { return listener.PatchTunnel(cfg.Tunnels, target) }},
 	}
 	for _, step := range steps {
 		if err := step.start(); err != nil {
