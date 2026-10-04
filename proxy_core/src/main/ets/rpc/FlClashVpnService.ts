@@ -175,9 +175,9 @@ export class FlClashVpnService extends CommonVpnService {
       await this.startClash(tunFd)
       if (generation !== this.startGeneration) return false
       // The protect channel and native TUN must be ready before proxy ingress.
-      // The current core API logs bind errors; this is not a listener-ready ACK.
+      // The core returns actual bind failures and rolls back partial ingress.
       if (!startListener()) {
-        throw new Error('代理监听配置尚未就绪')
+        throw new Error('代理监听启动失败，请检查端口占用和监听配置')
       }
       return true
     } catch (error) {

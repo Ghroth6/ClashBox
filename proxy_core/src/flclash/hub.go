@@ -60,7 +60,7 @@ func handleInitClash(homeDirStr string) bool {
 func handleStartListener() bool {
 	runLock.Lock()
 	defer runLock.Unlock()
-	if currentConfig == nil {
+	if currentConfig == nil || !systemTUNReadyLocked() {
 		return false
 	}
 	if isRunning {
@@ -81,7 +81,10 @@ func handleStopListener() bool {
 	defer runLock.Unlock()
 	isRunning = false
 	stopCoreEvents()
-	stopListeners()
+	if err := stopListeners(); err != nil {
+		log.Errorln("Stop proxy listeners: %s", err)
+		return false
+	}
 	return true
 }
 
@@ -101,11 +104,14 @@ func handleShutdown() bool {
 	defer runLock.Unlock()
 	isRunning = false
 	stopCoreEvents()
-	stopListeners()
+	err := stopListeners()
+	if err != nil {
+		log.Errorln("Shutdown proxy listeners: %s", err)
+	}
 	executor.Shutdown()
 	runtime.GC()
 	isInit = false
-	return true
+	return err == nil
 }
 
 func handleValidateConfig(bytes []byte) string {

@@ -224,29 +224,45 @@ func patchConfig() {
 	})
 }
 
-func updateListeners(force bool) error {
+func updateListeners(force bool) (err error) {
 	if !isRunning || currentConfig == nil {
 		return nil
+	}
+	defer func() {
+		if err != nil {
+			isRunning = false
+			stopCoreEvents()
+			err = errors.Join(err, stopListeners())
+			handleCloseConnectionsUnLock()
+		}
+	}()
+	if !systemTUNReadyLocked() {
+		return errors.New("system TUN is not ready for proxy listeners")
 	}
 	runtime, err := compat.FreshProxyListeners(currentConfig, currentRawListeners)
 	if err != nil {
 		return err
 	}
 	if force {
-		stopListeners()
+		if err = stopListeners(); err != nil {
+			return err
+		}
 	}
-	compat.StartProxyListeners(runtime)
+	if err = compat.StartProxyListeners(runtime); err != nil {
+		return err
+	}
 	if !systemOwnsTUN {
 		listener.ReCreateTun(currentConfig.General.Tun, tunnel.Tunnel)
 	}
 	return nil
 }
 
-func stopListeners() {
-	compat.StopProxyListeners()
+func stopListeners() error {
+	err := compat.StopProxyListeners()
 	if !systemOwnsTUN {
 		listener.ReCreateTun(LC.Tun{}, tunnel.Tunnel)
 	}
+	return err
 }
 
 func patchSelectGroup() error {

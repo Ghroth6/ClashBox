@@ -1,6 +1,7 @@
 package compat
 
 import (
+	"errors"
 	"net"
 	"reflect"
 	"strconv"
@@ -133,7 +134,7 @@ func TestProxyListenersStoppedApplyAndRepeatedRestore(t *testing.T) {
 	cfg.Listeners = map[string]C.InboundListener{"test-http": namedListener}
 	rawListeners := []map[string]any{{"type": "http", "name": "test-http", "listen": "127.0.0.1", "port": named.port}}
 	cfg.Tunnels = []LC.Tunnel{{Network: []string{"tcp", "udp"}, Address: tun.addr, Target: "127.0.0.1:9", Proxy: "DIRECT"}}
-	t.Cleanup(StopProxyListeners)
+	t.Cleanup(func() { _ = StopProxyListeners() })
 	ConfigureEmbeddedController()
 	for cycle := 0; cycle < 3; cycle++ {
 		// All entry points must be absent directly after real config application.
@@ -154,8 +155,12 @@ func TestProxyListenersStoppedApplyAndRepeatedRestore(t *testing.T) {
 		if run.Listeners["test-http"] == namedListener {
 			t.Fatal("reused profile listener object")
 		}
-		StartProxyListeners(run)
-		StartProxyListeners(run) // an idempotent update must not drop ports
+		if err := StartProxyListeners(run); err != nil {
+			t.Fatal(err)
+		}
+		if err := StartProxyListeners(run); err != nil { // an idempotent update must not drop ports
+			t.Fatal(err)
+		}
 		if run.Listeners["test-http"].Address() != named.addr {
 			t.Fatal("named listener retained old handles")
 		}
@@ -165,14 +170,79 @@ func TestProxyListenersStoppedApplyAndRepeatedRestore(t *testing.T) {
 		for _, p := range []testPort{socks, mixed, tun} {
 			assertPortOpen(t, "udp", p.addr)
 		}
-		StopProxyListeners()
-		StopProxyListeners()
+		if err := StopProxyListeners(); err != nil {
+			t.Fatal(err)
+		}
+		if err := StopProxyListeners(); err != nil {
+			t.Fatal(err)
+		}
 		for _, p := range []testPort{http, socks, mixed, named, tun} {
 			assertPortFree(t, "tcp", p.addr)
 		}
 		for _, p := range []testPort{socks, mixed, tun} {
 			assertPortFree(t, "udp", p.addr)
 		}
+	}
+}
+
+func TestProxyListenerBindFailureRollsBackAllIngressAndCanRetry(t *testing.T) {
+	for _, network := range []string{"tcp", "udp"} {
+		t.Run(network, func(t *testing.T) {
+			http, named, mixed := reserveProxyPort(t), reserveProxyPort(t), reserveProxyPort(t)
+			var closeBlocker func() error
+			if network == "tcp" {
+				blocker, err := net.Listen(network, mixed.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				closeBlocker = blocker.Close
+			} else {
+				blocker, err := net.ListenPacket(network, mixed.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				closeBlocker = blocker.Close
+			}
+			t.Cleanup(func() { _ = closeBlocker(); _ = StopProxyListeners() })
+			cfg := &config.Config{General: &config.General{Inbound: config.Inbound{
+				Port: http.port, MixedPort: mixed.port, BindAddress: "127.0.0.1",
+			}}}
+			raw := []map[string]any{{"type": "http", "name": "early", "listen": "127.0.0.1", "port": named.port}}
+			run, err := FreshProxyListeners(cfg, raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = StartProxyListeners(run)
+			var bindError *net.OpError
+			if !errors.As(err, &bindError) {
+				t.Fatalf("want actual bind error, got %v", err)
+			}
+			assertPortFree(t, "tcp", http.addr)
+			assertPortFree(t, "tcp", named.addr)
+			// A failed UDP bind must also release its already-open TCP peer.
+			if network == "udp" {
+				assertPortFree(t, "tcp", mixed.addr)
+			}
+			if err := closeBlocker(); err != nil {
+				t.Fatal(err)
+			}
+			assertPortFree(t, "tcp", mixed.addr)
+			assertPortFree(t, "udp", mixed.addr)
+			run, err = FreshProxyListeners(cfg, raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := StartProxyListeners(run); err != nil {
+				t.Fatal(err)
+			}
+			assertPortOpen(t, "tcp", named.addr)
+			assertPortOpen(t, "tcp", http.addr)
+			assertPortOpen(t, "tcp", mixed.addr)
+			assertPortOpen(t, "udp", mixed.addr)
+			if err := StopProxyListeners(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

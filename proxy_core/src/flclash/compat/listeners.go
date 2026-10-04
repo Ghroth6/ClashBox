@@ -1,6 +1,7 @@
 package compat
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
@@ -56,40 +57,52 @@ func FreshProxyListeners(cfg *config.Config, raw []map[string]any) (*config.Conf
 }
 
 // StartProxyListeners restores the core-managed proxy ingress only. The caller
-// serializes this with config application and StopProxyListeners. Official
-// ReCreate/Patch APIs log bind failures; returning here is NOT a readiness ACK.
-func StartProxyListeners(cfg *config.Config) {
+// serializes this with config application and StopProxyListeners. Any actual
+// bind failure closes the complete proxy ingress set before returning an error.
+func StartProxyListeners(cfg *config.Config) error {
 	g := cfg.General
 	listener.SetAllowLan(g.AllowLan)
 	inbound.SetSkipAuthPrefixes(g.SkipAuthPrefixes)
 	inbound.SetAllowedIPs(g.LanAllowedIPs)
 	inbound.SetDisAllowedIPs(g.LanDisAllowedIPs)
 	listener.SetBindAddress(g.BindAddress)
-	listener.PatchInboundListeners(cfg.Listeners, tunnel.Tunnel, true)
-	listener.ReCreateHTTP(g.Port, tunnel.Tunnel)
-	listener.ReCreateSocks(g.SocksPort, tunnel.Tunnel)
-	listener.ReCreateRedir(g.RedirPort, tunnel.Tunnel)
-	listener.ReCreateTProxy(g.TProxyPort, tunnel.Tunnel)
-	listener.ReCreateMixed(g.MixedPort, tunnel.Tunnel)
-	listener.ReCreateShadowSocks(g.ShadowSocksConfig, tunnel.Tunnel)
-	listener.ReCreateVmess(g.VmessConfig, tunnel.Tunnel)
-	listener.ReCreateTuic(g.TuicServer, tunnel.Tunnel)
-	listener.PatchTunnel(cfg.Tunnels, tunnel.Tunnel)
+	steps := []struct {
+		name  string
+		start func() error
+	}{
+		{"named", func() error { return listener.PatchInboundListeners(cfg.Listeners, tunnel.Tunnel, true) }},
+		{"http", func() error { return listener.ReCreateHTTP(g.Port, tunnel.Tunnel) }},
+		{"socks", func() error { return listener.ReCreateSocks(g.SocksPort, tunnel.Tunnel) }},
+		{"redir", func() error { return listener.ReCreateRedir(g.RedirPort, tunnel.Tunnel) }},
+		{"tproxy", func() error { return listener.ReCreateTProxy(g.TProxyPort, tunnel.Tunnel) }},
+		{"mixed", func() error { return listener.ReCreateMixed(g.MixedPort, tunnel.Tunnel) }},
+		{"shadowsocks", func() error { return listener.ReCreateShadowSocks(g.ShadowSocksConfig, tunnel.Tunnel) }},
+		{"vmess", func() error { return listener.ReCreateVmess(g.VmessConfig, tunnel.Tunnel) }},
+		{"tuic", func() error { return listener.ReCreateTuic(g.TuicServer, tunnel.Tunnel) }},
+		{"tunnels", func() error { return listener.PatchTunnel(cfg.Tunnels, tunnel.Tunnel) }},
+	}
+	for _, step := range steps {
+		if err := step.start(); err != nil {
+			return errors.Join(fmt.Errorf("start %s listeners: %w", step.name, err), StopProxyListeners())
+		}
+	}
+	return nil
 }
 
 // StopProxyListeners closes registered named, legacy and tunnel listeners. It
 // deliberately leaves the wrapper-owned system TUN, DNS and controller alone.
-// Upstream partial-construction failures and close errors need a core API fix;
-// these void APIs cannot provide a transactional shutdown receipt.
-func StopProxyListeners() {
-	listener.PatchInboundListeners(nil, tunnel.Tunnel, true)
-	listener.PatchTunnel(nil, tunnel.Tunnel)
-	listener.ReCreateHTTP(0, tunnel.Tunnel)
-	listener.ReCreateSocks(0, tunnel.Tunnel)
-	listener.ReCreateRedir(0, tunnel.Tunnel)
-	listener.ReCreateTProxy(0, tunnel.Tunnel)
-	listener.ReCreateMixed(0, tunnel.Tunnel)
-	listener.ReCreateShadowSocks("", tunnel.Tunnel)
-	listener.ReCreateVmess("", tunnel.Tunnel)
-	listener.ReCreateTuic(LC.TuicServer{}, tunnel.Tunnel)
+// Every close is attempted, including after an earlier close reports an error.
+func StopProxyListeners() error {
+	return errors.Join(
+		listener.PatchInboundListeners(nil, tunnel.Tunnel, true),
+		listener.PatchTunnel(nil, tunnel.Tunnel),
+		listener.ReCreateHTTP(0, tunnel.Tunnel),
+		listener.ReCreateSocks(0, tunnel.Tunnel),
+		listener.ReCreateRedir(0, tunnel.Tunnel),
+		listener.ReCreateTProxy(0, tunnel.Tunnel),
+		listener.ReCreateMixed(0, tunnel.Tunnel),
+		listener.ReCreateShadowSocks("", tunnel.Tunnel),
+		listener.ReCreateVmess("", tunnel.Tunnel),
+		listener.ReCreateTuic(LC.TuicServer{}, tunnel.Tunnel),
+	)
 }
