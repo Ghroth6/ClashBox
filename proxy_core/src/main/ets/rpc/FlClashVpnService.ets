@@ -1,4 +1,5 @@
 import { requireAllowlist } from './AllowlistPolicy';
+import { VpnLifecycle, VpnOperationResult, VpnRunOwner } from './VpnLifecycle';
 import { PlatformNetworkMonitor } from './NetworkSnapshot';
 import { vpnExtension, socket } from '@kit.NetworkKit';
 import {
@@ -56,12 +57,27 @@ export interface VpnOptions {
 
 
 export class FlClashVpnService extends CommonVpnService {
-  vpnConnection: vpnExtension.VpnConnection | undefined
   public configPath: string = ""
   protectSocketPath: string = ""
   private clashSocket: socket.LocalSocket | undefined
   private textDecoder: util.TextDecoder = new util.TextDecoder()
   private networkMonitor: PlatformNetworkMonitor = new PlatformNetworkMonitor()
+  private runOwner: VpnRunOwner | undefined
+  private runConfig: VpnConfig | undefined
+  private nativeToken: string = ''
+  private channelClose: Promise<void> | undefined
+  private cancelStartClash: ((error: Error) => void) | undefined
+  private lifecycle: VpnLifecycle = new VpnLifecycle({
+    prepare: (owner: VpnRunOwner): Promise<void> => this.prepareVpn(owner),
+    create: (owner: VpnRunOwner): Promise<number> => this.createVpn(owner),
+    startNative: (owner: VpnRunOwner, fd: number): Promise<void> => this.startClash(fd, this.nativeToken),
+    startListeners: (owner: VpnRunOwner): void => {
+      if (owner.cancelled || !startListener()) throw new Error('代理监听启动失败，请检查端口占用和监听配置')
+    },
+    cancelNative: (owner: VpnRunOwner): string => stopTun(),
+    closeChannel: (owner: VpnRunOwner): Promise<void> => this.closeProtectChannel(owner),
+    destroy: (owner: VpnRunOwner): Promise<void> => this.destroyVpn(owner)
+  })
 
   override async onRemoteMessageRequest(client: socket.LocalSocketConnection, message: socket.LocalSocketMessageInfo): Promise<void> {
     let request = JSON.parse(this.textDecoder.decodeToString(new Uint8Array(message.message))) as RpcRequest
@@ -71,28 +87,32 @@ export class FlClashVpnService extends CommonVpnService {
       let result = await this.onRemoteMessage(code, params)
       this.sendClient(client, JSON.stringify({ result: result, error: undefined }))
     } catch (e) {
-      console.error(`socket stub ${code} result: `, e.message ?? e, e.stack)
-      this.sendClient(client, JSON.stringify({ error: e.message ?? e }))
+      const error = e as Error
+      console.error(`socket stub ${code} result: `, error.message, error.stack)
+      this.sendClient(client, JSON.stringify({ error: error.message }))
     }
   }
-  /** 防止多次调用 stopVpn 导致 stopTun 重复执行 */
-  private isStopped: boolean = true
-  private isStarting: boolean = false
-  private startGeneration: number = 0
-
   async onRemoteMessage(code: number, data: (string | number | boolean)[]): Promise<string | number | boolean> {
     switch (code) {
       case ClashRpcType.startClash: {
-        return await this.startVpn()
+        return JSON.stringify(await this.runCommand(true, data))
       }
       case ClashRpcType.stopClash: {
-        this.stopVpn()
-        return true
+        return JSON.stringify(await this.runCommand(false, data))
       }
       default: {
         return "不支持当前操作"
       }
     }
+  }
+
+  private runCommand(start: boolean, data: (string | number | boolean)[]): Promise<VpnOperationResult> {
+    if (data.length === 0) return start ? this.startVpn() : this.stopVpn()
+    if (data.length !== 2 || typeof data[0] !== 'string' || data[0].length === 0 || data[0].length > 128 ||
+      typeof data[1] !== 'number' || !Number.isSafeInteger(data[1]) || data[1] < 0) {
+      return Promise.resolve(this.lifecycle.snapshot('invalid-command', 'VPN 操作标识无效'))
+    }
+    return this.lifecycle.execute(start, data[0] as string, data[1] as number)
   }
 
   ParseConfig(): VpnConfig {
@@ -156,44 +176,24 @@ export class FlClashVpnService extends CommonVpnService {
     console.debug("vpnConfig", JSON.stringify(vpnConfig))
     return vpnConfig;
   }
-  override async startVpn(): Promise<boolean> {
-    if (this.isStarting) return false
-    if (!this.isStopped) return true
-    this.isStarting = true
-    this.isStopped = false
-    const generation = ++this.startGeneration
-    try {
-      const config = this.ParseConfig()
-      const nativeToken = getTunStartToken()
-      await this.networkMonitor.start()
-      if (generation !== this.startGeneration) return false
-      const tunFd = await super.getTunFd(config)
-      if (generation !== this.startGeneration) return false
-      if (tunFd <= 0) {
-        throw new Error('系统未返回有效的 TUN 文件描述符')
-      }
-      await this.startClash(tunFd, nativeToken)
-      if (generation !== this.startGeneration) return false
-      // The protect channel and native TUN must be ready before proxy ingress.
-      // The core returns actual bind failures and rolls back partial ingress.
-      if (!startListener()) {
-        throw new Error('代理监听启动失败，请检查端口占用和监听配置')
-      }
-      return true
-    } catch (error) {
-      console.error("ClashVPN  error ", error)
-      if (generation === this.startGeneration) this.stopVpn()
-      return false
-    } finally {
-      this.isStarting = false
-    }
+  override startVpn(): Promise<VpnOperationResult> {
+    return this.lifecycle.start()
+  }
+
+  private async prepareVpn(owner: VpnRunOwner): Promise<void> {
+    this.runOwner = owner
+    this.runConfig = this.ParseConfig()
+    this.nativeToken = getTunStartToken()
+    await this.networkMonitor.start()
+  }
+
+  private createVpn(owner: VpnRunOwner): Promise<number> {
+    if (!this.runConfig || this.runOwner !== owner) return Promise.reject(new Error('VPN 配置不属于当前启动'))
+    return this.getTunFd(this.runConfig, owner)
   }
 
   async startClash(tunFd: number, nativeToken: string): Promise<void> {
-    const previousSocket = this.clashSocket
-    this.clashSocket = undefined
-    previousSocket?.off('message')
-    previousSocket?.close()
+    if (this.clashSocket) throw new Error('上轮保护通道尚未关闭')
     let tcp: socket.LocalSocket = socket.constructLocalSocketInstance();
     this.clashSocket = tcp
     const socketPath = this.context?.filesDir + '/clash_go.sock'
@@ -214,10 +214,13 @@ export class FlClashVpnService extends CommonVpnService {
           reject(error)
         }
       }
+      this.cancelStartClash = fail
       const disconnected = (error: Error) => {
         if (this.clashSocket !== tcp) return
         fail(error)
-        if (nativeReady) this.stopVpn()
+        if (nativeReady) this.stopVpn().then((result: VpnOperationResult) => {
+          if (result.error) console.error('ClashVPN disconnect cleanup', JSON.stringify(result))
+        })
       }
       tcp.on('close', () => disconnected(new Error('原生 TUN 保护通道已关闭')))
       tcp.on('error', (error: Error) => disconnected(error))
@@ -253,13 +256,13 @@ export class FlClashVpnService extends CommonVpnService {
           boundary = pending.indexOf('EOF')
         }
       })
-      tcp.connect({ address: { address: socketPath }, timeout: 1000 }).then(async () => {
+      tcp.connect({ address: { address: socketPath }, timeout: 1000 }).then(async (): Promise<void> => {
         if (settled || this.clashSocket !== tcp) {
           fail(new Error('原生 TUN 启动已取消'))
           return
         }
         await tcp.send({ data: JSON.stringify({ method: ClashRpcType.startClash, params: [tunFd, nativeToken] }) })
-      }).catch((error: Error) => fail(error))
+      }).catch((error: Error): void => fail(error))
     })
   }
 
@@ -268,13 +271,14 @@ export class FlClashVpnService extends CommonVpnService {
    * 每个 fd 独立执行。失败或通道更换不发送 ACK，由原生端拒绝未受保护的出站连接。
    */
   private handleProtectMessage(element: string, owner: socket.LocalSocket): void {
-    if (this.clashSocket !== owner) return
+    const runOwner = this.runOwner
+    if (this.clashSocket !== owner || !runOwner || runOwner.cancelled) return
     if (element == "") return
     try {
       let json = JSON.parse(element) as RpcResult
       let fd = JSON.parse(json.result as string) as Fd
       this.protectWithRetry(fd.value, 3, owner).then(() => {
-        if (this.clashSocket === owner) setFdMap(fd.id)
+        if (this.clashSocket === owner && this.runOwner === runOwner && !runOwner.cancelled) setFdMap(fd.id)
       }).catch((protectErr: Error) => {
         // 重试仍失败：打 hilog 点便于确认后台 protect 是否被系统中断（hilog | grep ClashVPN protect）
         console.error("ClashVPN protect failed after retry, skipping setFdMap for fd.id=" + fd.id, protectErr.message, element)
@@ -284,23 +288,30 @@ export class FlClashVpnService extends CommonVpnService {
     }
   }
 
-  stopVpn() {
-    this.startGeneration++
-    if (this.isStopped) return
-    this.isStopped = true
-    // Native Stop first cancels pending protect requests, then closes ingress
-    // and TUN. Calling stopListener here first could block behind its constructor.
-    stopTun()
-    const previousSocket = this.clashSocket
-    this.clashSocket = undefined
-    previousSocket?.off('message')
-    previousSocket?.close()
-    super.stopVpn()
+  override stopVpn(): Promise<VpnOperationResult> {
+    return this.lifecycle.stop()
   }
 
-  shutdown() {
-    this.stopVpn()
+  private closeProtectChannel(owner: VpnRunOwner): Promise<void> {
+    if (this.runOwner !== owner) return Promise.reject(new Error('拒绝清理其他运行实例的保护通道'))
+    this.cancelStartClash?.(new Error('原生 TUN 启动已取消'))
+    this.cancelStartClash = undefined
+    const tcp = this.clashSocket
+    if (!tcp) return Promise.resolve()
+    if (this.channelClose) return this.channelClose
+    tcp.off('message')
+    tcp.off('close')
+    tcp.off('error')
+    this.channelClose = tcp.close().then(() => {
+      if (this.clashSocket === tcp) this.clashSocket = undefined
+    }).finally(() => { this.channelClose = undefined })
+    return this.channelClose
+  }
+
+  async shutdown(): Promise<VpnOperationResult> {
+    const result = await this.stopVpn()
     this.networkMonitor.stop()
+    return result
   }
 
   /**
@@ -308,11 +319,14 @@ export class FlClashVpnService extends CommonVpnService {
    * 失败重试可避免出站 fd 未保护导致流量回环（直连断网）
    */
   private async protectWithRetry(fd: number, retries: number, owner: socket.LocalSocket): Promise<void> {
+    const runOwner = this.runOwner
     let lastErr: Error | undefined = undefined
     for (let i = 0; i < retries; i++) {
-      if (this.clashSocket !== owner) throw new Error('原生 TUN 保护请求已取消')
+      if (this.clashSocket !== owner || !runOwner || runOwner.cancelled || this.runOwner !== runOwner) {
+        throw new Error('原生 TUN 保护请求已取消')
+      }
       try {
-        await this.protect(fd)
+        await this.protect(fd, runOwner)
         return
       } catch (e) {
         lastErr = e as Error

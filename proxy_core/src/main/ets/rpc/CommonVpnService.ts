@@ -1,6 +1,7 @@
 import { requireAllowlist } from './AllowlistPolicy';
 import { socket, vpnExtension } from "@kit.NetworkKit";
 import { common } from "@kit.AbilityKit";
+import { VpnOperationResult, VpnRunOwner } from './VpnLifecycle';
 
 export class Address {
   address: string;
@@ -54,53 +55,64 @@ export class VpnConfig {
 export abstract class CommonVpnService{
   context: common.Context
   vpnConnection : vpnExtension.VpnConnection | undefined
+  private vpnOwner: VpnRunOwner | undefined
+  private destroyPromise: Promise<void> | undefined
+  private protectRequests: Promise<void>[] = []
   constructor(context: common.Context) {
     this.context = context
   }
   async sendClient(client: socket.LocalSocketConnection, message: string){
-    await client.send({data: message, encoding:"utf-8", })
+    await client.send({data: message + "EOF", encoding:"utf-8", })
   }
   abstract onRemoteMessageRequest(client: socket.LocalSocketConnection, message: socket.LocalSocketMessageInfo): Promise<void>
-  abstract init()
-  async getTunFd(config: VpnConfig): Promise<number> {
+  abstract init(): Promise<void>
+  async getTunFd(config: VpnConfig, owner: VpnRunOwner): Promise<number> {
     if (config.blockedApplications && config.blockedApplications.length > 0) {
       throw new Error('本实验版不接受黑名单 VPN 配置');
     }
     config.trustedApplications = requireAllowlist(true, 'AcceptSelected', config.trustedApplications ?? []);
     config.blockedApplications = undefined;
-
+    if (owner.cancelled) throw new Error('系统 VPN 创建已取消')
+    if (this.vpnConnection) throw new Error('上轮系统 VPN 尚未销毁')
     const connection = vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext)
+    this.vpnOwner = owner
     this.vpnConnection = connection
-    try {
-      const tunFd = await connection.create(config)
-      if (this.vpnConnection !== connection) {
-        // Stop may have run while OS creation was pending. Destroy the late
-        // result too, without touching a later connection's ownership.
-        await connection.destroy()
-        return -1
-      }
-      console.log("ClashVPN", `获取tunFd: ${tunFd}`)
-      return tunFd;
-    } catch (error) {
-      console.log("ClashVPN", `Clash启动失败 ${error.message} => ${error.stack}` )
-      if (this.vpnConnection === connection) this.vpnConnection = undefined
-      await connection.destroy()
-      return -1
-    }
+    // Even a rejected create may have platform resources. Keep its object until
+    // destroy acknowledges success; lifecycle waits for this create before cleanup.
+    return await connection.create(config)
   }
-  async protect(fd: number): Promise<void> {
-    if (!this.vpnConnection) {
+  async protect(fd: number, owner: VpnRunOwner): Promise<void> {
+    if (!this.vpnConnection || this.vpnOwner !== owner || owner.cancelled) {
       throw new Error("VpnConnection not initialized, cannot protect fd=" + fd)
     }
-    await this.vpnConnection.protect(fd)
-  }
-  abstract startVpn(): Promise<boolean>
-  stopVpn(){
-    if(this.vpnConnection){
-      this.vpnConnection.destroy()
-      this.vpnConnection = undefined
+    const request = this.vpnConnection.protect(fd)
+    // Observe completion independently of success; a rejected protect blocks its
+    // socket, but is not itself a resource-cleanup failure.
+    const settled = request.then(() => {}, () => {})
+    this.protectRequests.push(settled)
+    try {
+      await request
+    } finally {
+      this.protectRequests = this.protectRequests.filter((item: Promise<void>) => item !== settled)
     }
   }
+  destroyVpn(owner: VpnRunOwner): Promise<void> {
+    const connection = this.vpnConnection
+    if (!connection) return Promise.resolve()
+    if (this.vpnOwner !== owner) return Promise.reject(new Error('拒绝销毁其他运行实例的 VPN'))
+    if (this.destroyPromise) return this.destroyPromise
+    // owner.cancelled prevents new protect calls. Retain and await calls already
+    // issued to the SDK so their completion cannot cross into the next run.
+    this.destroyPromise = Promise.all(this.protectRequests).then(() => connection.destroy()).then(() => {
+      if (this.vpnConnection === connection && this.vpnOwner === owner) {
+        this.vpnConnection = undefined
+        this.vpnOwner = undefined
+      }
+    }).finally(() => { this.destroyPromise = undefined })
+    return this.destroyPromise
+  }
+  abstract startVpn(): Promise<VpnOperationResult>
+  abstract stopVpn(): Promise<VpnOperationResult>
 }
 
 export function isIpv4(ip: string): Boolean {

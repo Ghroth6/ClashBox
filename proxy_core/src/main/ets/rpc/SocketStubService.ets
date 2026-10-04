@@ -5,6 +5,7 @@ import { startIpc } from 'libflclash.so';
 import { fileIo } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { writeFile } from '../fileUtils';
+import { VpnOperationResult } from './VpnLifecycle';
 
 
 export class SocketStubService {
@@ -30,7 +31,7 @@ export class SocketStubService {
             console.log("SocketStubService 清理残留 socket 文件: " + path)
           }
         } catch (e) {
-          console.warn(`SocketStubService 清理残留 socket 文件失败: ${path} ${e.message}`)
+          console.warn(`SocketStubService 清理残留 socket 文件失败: ${path} ${(e as Error).message}`)
         }
       }
       startIpc(goPath)
@@ -48,8 +49,12 @@ export class SocketStubService {
       })
       await this.lockVpn(requestId)
     } catch (e) {
-      this.vpnService.shutdown()
-      console.error("socket failure", e.message)
+      const cleanup = await this.vpnService.shutdown()
+      console.error("socket failure", (e as Error).message)
+      if (cleanup.state !== 'Stopped') {
+        console.error('SocketStubService cleanup incomplete', JSON.stringify(cleanup))
+        return
+      }
       // 启动失败也清理残留文件, 避免下一次 startService 同样被旧文件阻塞
       try {
         const socketPath = this.vpnService.context.filesDir + '/ClashBox.sock'
@@ -60,7 +65,7 @@ export class SocketStubService {
           }
         }
       } catch (cleanErr) {
-        console.warn(`SocketStubService 失败后清理 socket 文件异常: ${cleanErr.message}`)
+        console.warn(`SocketStubService 失败后清理 socket 文件异常: ${(cleanErr as Error).message}`)
       }
     }
   }
@@ -69,11 +74,11 @@ export class SocketStubService {
     let encoder = new util.TextEncoder()
     writeFile(lockPath, encoder.encodeInto(local + ""))
   }
-  startVpn(){
-    this.vpnService.startVpn()
+  startVpn(): Promise<VpnOperationResult> {
+    return this.vpnService.startVpn()
   }
-  stopVpn(){
-    this.vpnService.stopVpn()
+  stopVpn(): Promise<VpnOperationResult> {
+    return this.vpnService.stopVpn()
   }
   async destroy(){
     this.clientPool.forEach((client) => {
@@ -83,7 +88,8 @@ export class SocketStubService {
     })
     this.clientPool.clear()
     this.server.off('connect')
-    this.vpnService.shutdown()
+    const cleanup = await this.vpnService.shutdown()
+    if (cleanup.state !== 'Stopped') return cleanup
     const socketPath = this.vpnService.context.filesDir + '/ClashBox.sock'
     const goPath = this.vpnService.context.filesDir + '/clash_go.sock'
     let lockPath = this.vpnService.context.filesDir + '/vpn_ipc.lock';
@@ -92,6 +98,7 @@ export class SocketStubService {
         await fileIo.unlink(path)
       }
     }
+    return cleanup
   }
 }
 function sleepTime(timeout = 100): Promise<void>{
