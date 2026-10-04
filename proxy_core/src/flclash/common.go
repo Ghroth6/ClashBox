@@ -259,6 +259,9 @@ func updateListeners(force bool) (err error) {
 
 func stopListeners() error {
 	err := compat.StopProxyListeners()
+	if err != nil {
+		log.Errorln("Stop proxy listeners: %s", err)
+	}
 	if !systemOwnsTUN {
 		listener.ReCreateTun(LC.Tun{}, tunnel.Tunnel)
 	}

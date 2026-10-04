@@ -82,7 +82,6 @@ func handleStopListener() bool {
 	isRunning = false
 	stopCoreEvents()
 	if err := stopListeners(); err != nil {
-		log.Errorln("Stop proxy listeners: %s", err)
 		return false
 	}
 	return true
@@ -105,9 +104,6 @@ func handleShutdown() bool {
 	isRunning = false
 	stopCoreEvents()
 	err := stopListeners()
-	if err != nil {
-		log.Errorln("Shutdown proxy listeners: %s", err)
-	}
 	executor.Shutdown()
 	runtime.GC()
 	isInit = false
