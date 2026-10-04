@@ -5,9 +5,12 @@ package main
 //#include "bridge.h"
 import "C"
 import (
+	"context"
+	"core/compat"
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 	"unsafe"
 
 	napi "github.com/likuai2010/ohos-napi"
@@ -44,6 +47,43 @@ func stopTun(env js.Env, this js.Value, args []js.Value) any {
 
 func getTunStartToken(env js.Env, this js.Value, args []js.Value) any {
 	return tunSessions.StartToken()
+}
+
+func beginPlatformNetwork(env js.Env, this js.Value, args []js.Value) any {
+	promise := env.NewPromise()
+	if len(args) != 1 {
+		promise.Resolve("platform network transition requires one owner token")
+		return promise
+	}
+	token, _ := napi.GetValueStringUtf8(env.Env, args[0].Value)
+	// Registration and cancellation occur before returning to ArkTS. Only the
+	// completion wait is asynchronous; a queued request cannot pass admission.
+	if err := tunSessions.BeginPlatform(token); err != nil {
+		promise.Resolve(err.Error())
+		return promise
+	}
+	compat.CancelManagementNetwork()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := compat.WaitManagementNetwork(ctx); err != nil {
+			promise.Resolve(err.Error())
+		} else {
+			promise.Resolve("")
+		}
+	}()
+	return promise
+}
+
+func completePlatformNetwork(env js.Env, this js.Value, args []js.Value) any {
+	if len(args) != 1 {
+		return "platform network completion requires one owner token"
+	}
+	token, _ := napi.GetValueStringUtf8(env.Env, args[0].Value)
+	if err := tunSessions.CompletePlatform(token, compat.ResumeManagementNetwork); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func validateConfig(env js.Env, this js.Value, args []js.Value) any {
@@ -282,6 +322,8 @@ func init() {
 	entry.Export("setFdMap", js.AsCallback(setFdMap))
 	entry.Export("stopTun", js.AsCallback(stopTun))
 	entry.Export("getTunStartToken", js.AsCallback(getTunStartToken))
+	entry.Export("beginPlatformNetwork", js.AsCallback(beginPlatformNetwork))
+	entry.Export("completePlatformNetwork", js.AsCallback(completePlatformNetwork))
 	entry.Export("forceGc", js.AsCallback(forceGc))
 	entry.Export("validateConfig", js.AsCallback(validateConfig))
 	entry.Export("updateConfig", js.AsCallback(updateConfig))
@@ -297,6 +339,7 @@ func init() {
 	entry.Export("updateExternalProvider", js.AsCallback(updateExternalProvider))
 	entry.Export("sideLoadExternalProvider", js.AsCallback(sideLoadExternalProvider))
 	entry.Export("getExternalProviders", js.AsCallback(getExternalProviders))
+	entry.Export("getExternalProvider", js.AsCallback(getExternalProvider))
 	entry.Export("getVpnOptions", js.AsCallback(getVpnOptions))
 	entry.Export("getCurrentProfileName", js.AsCallback(getCurrentProfileName))
 	entry.Export("setProcessMap", js.AsCallback(setProcessMap))

@@ -7,6 +7,8 @@ export const setFdMap: (fd: number) => void;
 // This result does not confirm that the system VPN has been destroyed.
 export const stopTun: () => string;
 export const getTunStartToken: () => string;
+export const beginPlatformNetwork: (owner: string) => Promise<string>;
+export const completePlatformNetwork: (owner: string) => string;
 export const forceGc: () => void;
 export const validateConfig: (paramsString: string) => Promise<string>;
 export const updateConfig: (paramsString: string) => Promise<string>;

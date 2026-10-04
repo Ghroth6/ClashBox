@@ -1,9 +1,9 @@
 import { requireAllowlist } from './AllowlistPolicy';
-import { VpnLifecycle, VpnOperationResult, VpnRunOwner } from './VpnLifecycle';
+import { VpnLifecycle, VpnLifecycleActions, VpnOperationResult, VpnRunOwner } from './VpnLifecycle';
 import { PlatformNetworkMonitor } from './NetworkSnapshot';
 import { vpnExtension, socket } from '@kit.NetworkKit';
 import {
-  startTun, stopTun, getTunStartToken, setFdMap, getVpnOptions, startLog, getProxies, getTraffic,
+  startTun, stopTun, getTunStartToken, beginPlatformNetwork, completePlatformNetwork, setFdMap, getVpnOptions, startLog, getProxies, getTraffic,
   getTotalTraffic,
   getExternalProviders,
   asyncTestDelay,
@@ -67,7 +67,7 @@ export class FlClashVpnService extends CommonVpnService {
   private nativeToken: string = ''
   private channelClose: Promise<void> | undefined
   private cancelStartClash: ((error: Error) => void) | undefined
-  private lifecycle: VpnLifecycle = new VpnLifecycle({
+  private lifecycleActions: VpnLifecycleActions = {
     prepare: (owner: VpnRunOwner): Promise<void> => this.prepareVpn(owner),
     create: (owner: VpnRunOwner): Promise<number> => this.createVpn(owner),
     startNative: (owner: VpnRunOwner, fd: number): Promise<void> => this.startClash(fd, this.nativeToken),
@@ -77,7 +77,8 @@ export class FlClashVpnService extends CommonVpnService {
     cancelNative: (owner: VpnRunOwner): string => stopTun(),
     closeChannel: (owner: VpnRunOwner): Promise<void> => this.closeProtectChannel(owner),
     destroy: (owner: VpnRunOwner): Promise<void> => this.destroyVpn(owner)
-  })
+  }
+  private lifecycle: VpnLifecycle = new VpnLifecycle(this.lifecycleActions)
 
   override async onRemoteMessageRequest(client: socket.LocalSocketConnection, message: socket.LocalSocketMessageInfo): Promise<void> {
     let request = JSON.parse(this.textDecoder.decodeToString(new Uint8Array(message.message))) as RpcRequest
@@ -184,12 +185,32 @@ export class FlClashVpnService extends CommonVpnService {
     this.runOwner = owner
     this.runConfig = this.ParseConfig()
     this.nativeToken = getTunStartToken()
+    owner.nativeToken = this.nativeToken
     await this.networkMonitor.start()
   }
 
-  private createVpn(owner: VpnRunOwner): Promise<number> {
+  private async createVpn(owner: VpnRunOwner): Promise<number> {
     if (!this.runConfig || this.runOwner !== owner) return Promise.reject(new Error('VPN 配置不属于当前启动'))
+    owner.platformNetwork = true
+    const error = await beginPlatformNetwork(owner.nativeToken)
+    if (error) throw new Error(error)
+    if (owner.cancelled) throw new Error('系统 VPN 创建已取消')
     return this.getTunFd(this.runConfig, owner)
+  }
+
+  override async destroyVpn(owner: VpnRunOwner): Promise<void> {
+    if (!owner.platformNetwork) return super.destroyVpn(owner)
+    // Wait old management sockets before changing system routes. A failed wait
+    // keeps this owner, and a later Stop retries the same platform operation.
+    const waitError = await beginPlatformNetwork(owner.nativeToken)
+    if (waitError) throw new Error(waitError)
+    await super.destroyVpn(owner)
+    // A previous timed-out cleanup can observe the same SDK Promise. It may
+    // already have acknowledged success before this retry resumes.
+    if (!owner.platformNetwork) return
+    const error = completePlatformNetwork(owner.nativeToken)
+    if (error) throw new Error(error)
+    owner.platformNetwork = false
   }
 
   async startClash(tunFd: number, nativeToken: string): Promise<void> {

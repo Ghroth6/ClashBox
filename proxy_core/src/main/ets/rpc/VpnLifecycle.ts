@@ -10,6 +10,8 @@ export class VpnRunOwner {
   generation: number
   cancelled: boolean = false
   stage: string = 'prepare'
+  nativeToken: string = ''
+  platformNetwork: boolean = false
 
   constructor(generation: number) {
     this.generation = generation

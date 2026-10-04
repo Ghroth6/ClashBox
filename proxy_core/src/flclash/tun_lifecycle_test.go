@@ -58,6 +58,59 @@ func TestTUNBootstrapAllowedOnlyBeforeFirstReservation(t *testing.T) {
 	}
 }
 
+func TestPlatformTransitionBlocksBeforeCreateAndRequiresSameDestroyedOwner(t *testing.T) {
+	var lifecycle tunLifecycle
+	token := lifecycle.StartToken()
+	if err := lifecycle.BeginPlatform(token); err != nil || !lifecycle.ProtectionRequired() {
+		t.Fatalf("platform create was not fenced: %v", err)
+	}
+	owner := lifecycle.NewSession(lifecycle.Generation())
+	if !lifecycle.Reserve(owner, func(Fd) {}) {
+		t.Fatal("reserve")
+	}
+	var resumed int
+	resume := func() error { resumed++; return nil }
+	if err := lifecycle.CompletePlatform(token, resume); err == nil || resumed != 0 {
+		t.Fatal("live native owner restored ordinary networking")
+	}
+	lifecycle.CancelAll()
+	if err := lifecycle.BeginPlatform(token); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.CompletePlatform(token, resume); err != nil || lifecycle.ProtectionRequired() {
+		t.Fatal(err)
+	}
+	next := lifecycle.StartToken()
+	if err := lifecycle.BeginPlatform(next); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.CompletePlatform(token, resume); err == nil || !lifecycle.ProtectionRequired() || resumed != 1 {
+		t.Fatal("old destroy acknowledged newer platform owner")
+	}
+}
+
+func TestPlatformResumeFailureRetainsOwnerAndProtectionForRetry(t *testing.T) {
+	var lifecycle tunLifecycle
+	token := lifecycle.StartToken()
+	if err := lifecycle.BeginPlatform(token); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle.CancelAll()
+	failure := errors.New("network resources still closing")
+	if err := lifecycle.CompletePlatform(token, func() error { return failure }); !errors.Is(err, failure) {
+		t.Fatal(err)
+	}
+	if !lifecycle.ProtectionRequired() {
+		t.Fatal("failure allowed unprotected sockets")
+	}
+	if err := lifecycle.CompletePlatform(token, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.BeginPlatform(token); err == nil {
+		t.Fatal("cancelled old token recreated platform ownership")
+	}
+}
+
 func TestTUNStopDuringConstructionPreventsPublish(t *testing.T) {
 	var lifecycle tunLifecycle
 	owner := lifecycle.NewSession(lifecycle.Generation())

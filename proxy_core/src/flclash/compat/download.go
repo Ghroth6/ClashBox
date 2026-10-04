@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/metacubex/http"
+	coreDialer "github.com/metacubex/mihomo/component/dialer"
+	coreForwarding "github.com/metacubex/mihomo/component/forwarding"
 	"github.com/metacubex/mihomo/component/resource"
 	"io"
 	"net"
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -22,6 +25,11 @@ func DownloadConfig(parent context.Context, url string, userAgent string, filePa
 	if filePath == "" {
 		return "", fmt.Errorf("filePath is empty")
 	}
+	parent, finish, err := coreForwarding.AcquireManagementNetwork(parent)
+	if err != nil {
+		return "", err
+	}
+	defer finish()
 
 	ctx, cancel := context.WithTimeout(parent, time.Second*20)
 	defer cancel()
@@ -46,7 +54,7 @@ func DownloadConfig(parent context.Context, url string, userAgent string, filePa
 
 	client := &http.Client{
 		Timeout:       time.Second * 20,
-		Transport:     newDownloadTransport(),
+		Transport:     newDownloadTransport(ctx),
 		CheckRedirect: limitDownloadRedirects,
 	}
 	defer client.CloseIdleConnections()
@@ -111,16 +119,49 @@ func normalizeDownloadURL(rawURL string) (string, string, error) {
 	return parsedURL.String(), authHeader, nil
 }
 
-func newDownloadTransport() *http.Transport {
-	dialer := &net.Dialer{
+func newDownloadTransport(parent context.Context) *http.Transport {
+	protected := &net.Dialer{
 		Timeout:   time.Second * 20,
 		KeepAlive: time.Second * 60,
+		ControlContext: func(ctx context.Context, network, address string, raw syscall.RawConn) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if coreDialer.DefaultSocketHook != nil {
+				return coreDialer.DefaultSocketHook(network, address, raw)
+			}
+			return nil
+		},
 	}
+	// DNS sockets need the same platform protection as the HTTP connection.
+	dialer := *protected
+	dialer.Resolver = &net.Resolver{PreferGo: true, Dial: managementDownloadDial(parent, protected.DialContext)}
 	return &http.Transport{
 		Proxy:               nil,
-		DialContext:         dialer.DialContext,
+		DialContext:         managementDownloadDial(parent, dialer.DialContext),
 		DisableKeepAlives:   true,
 		TLSHandshakeTimeout: time.Second * 10,
+	}
+}
+
+func managementDownloadDial(parent context.Context, dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	return func(request context.Context, network, address string) (net.Conn, error) {
+		// HTTP transports can detach their dial context from request cancellation.
+		// Keep every DNS/TCP construction tied to the original network epoch and
+		// register the returned physical socket before releasing construction.
+		ctx, finish, err := coreForwarding.AcquireManagementNetwork(parent)
+		if err != nil {
+			return nil, err
+		}
+		defer finish()
+		ctx, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(request, cancel)
+		defer func() { stop(); cancel() }()
+		conn, err := dial(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return coreForwarding.OwnNetworkConn(ctx, conn)
 	}
 }
 

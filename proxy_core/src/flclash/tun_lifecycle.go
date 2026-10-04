@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"sync"
 )
@@ -25,6 +26,8 @@ type tunLifecycle struct {
 	current            *tunSession
 	ready              bool
 	protectionRequired bool
+	platformOwned      bool
+	platformToken      uint64
 }
 
 var tunSessions tunLifecycle
@@ -109,6 +112,54 @@ func (l *tunLifecycle) ProtectionRequired() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.protectionRequired
+}
+
+// Register before the platform create call, including its pending/failed state.
+// Stop changes the admission generation, but destruction still belongs to the
+// original token. A delayed old acknowledgement cannot release a newer VPN.
+func (l *tunLifecycle) BeginPlatform(token string) error {
+	generation, err := strconv.ParseUint(token, 10, 64)
+	if err != nil {
+		return errors.New("invalid platform VPN owner")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.platformOwned {
+		if l.platformToken != generation {
+			return errors.New("platform VPN belongs to another owner")
+		}
+		return nil
+	}
+	if generation != l.generation {
+		return errors.New("platform VPN start was cancelled")
+	}
+	l.platformOwned = true
+	l.platformToken = generation
+	l.protectionRequired = true
+	return nil
+}
+
+func (l *tunLifecycle) CompletePlatform(token string, resume func() error) error {
+	generation, err := strconv.ParseUint(token, 10, 64)
+	if err != nil {
+		return errors.New("invalid platform VPN owner")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.platformOwned || l.platformToken != generation {
+		return errors.New("platform VPN destruction does not belong to current owner")
+	}
+	if l.current.Valid() {
+		return errors.New("native VPN owner is still active")
+	}
+	// Resume cannot admit a socket while this mutex guards the hook's protection
+	// decision. Keep ownership on failure so the same completion can be retried.
+	if err := resume(); err != nil {
+		return err
+	}
+	l.platformOwned = false
+	l.protectionRequired = false
+	return nil
 }
 
 func (l *tunLifecycle) cancelLocked(s *tunSession) {

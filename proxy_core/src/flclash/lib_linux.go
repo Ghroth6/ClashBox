@@ -110,6 +110,9 @@ func StartTUN(fd int, owner *tunSession, markSocket func(Fd)) error {
 		}
 		return errors.Join(errors.New("TUN start was cancelled"), closeErr)
 	}
+	if err := compat.ResumeManagementNetwork(); err != nil {
+		return fmt.Errorf("resume protected management network: %w", err)
+	}
 	now := time.Now()
 	runTime = &now
 	startKeepalive()
@@ -203,6 +206,9 @@ func StopTun() error {
 	// Invalidate requests captured before Stop, even when their handler has not
 	// reached StartTUN yet. This also releases pending protect waits immediately.
 	tunSessions.CancelAll()
+	if tunSessions.ProtectionRequired() {
+		compat.CancelManagementNetwork()
+	}
 	compat.CancelForwarding()
 	runLock.Lock()
 	defer runLock.Unlock()
@@ -218,6 +224,7 @@ func StopTunOwner(owner *tunSession) error {
 	if tunOwner != owner || owner == nil {
 		return nil
 	}
+	compat.CancelManagementNetwork()
 	return stopTunLocked()
 }
 
@@ -276,6 +283,7 @@ func init() {
 	// The function pointer is immutable after package initialization; sessions
 	// change through an atomic owner pointer. After bootstrap, no owner is blocked.
 	initSocketHook()
+	compat.EnableManagementNetwork()
 	process.DefaultPackageNameResolver = func(metadata *constant.Metadata) (string, error) {
 		if metadata == nil {
 			return "", process.ErrInvalidNetwork

@@ -66,6 +66,14 @@ function fixture(options = {}) {
     },
     getVpnOptions() { calls.push('config'); if (options.configError) throw new Error(options.configError); return JSON.stringify(config); },
     getTunStartToken() { calls.push('token'); return '17'; },
+    async beginPlatformNetwork(token) {
+      calls.push('network-transition:' + token);
+      return options.transition ? await options.transition() : '';
+    },
+    completePlatformNetwork(token) {
+      calls.push('network-restored:' + token);
+      return options.restore ? options.restore() : '';
+    },
     stopTun() { calls.push('native-stop'); return options.stopNative ? options.stopNative() : ''; },
     startListener() { calls.push('listeners'); return options.listeners !== false; },
     setFdMap(id) { calls.push('protect-ack:' + id); },
@@ -96,6 +104,83 @@ test('token precedes the first await; listeners wait for actual native ready; re
   assert.equal(f.calls.filter(x => x === 'create').length, 1);
   assert.equal((await f.service.stopVpn()).state, 'Stopped');
   assert.ok(f.calls.indexOf('native-stop') < f.calls.indexOf('channel-close'));
+});
+
+test('platform creation waits for management sockets; ordinary network resumes only after destroy acknowledgement', async () => {
+  const transition = deferred(), destroy = deferred();
+  const f = fixture({ transition: () => transition.promise, destroy: () => destroy.promise });
+  const start = f.service.startVpn();
+  await until(() => f.calls.includes('network-transition:17'));
+  assert.equal(f.calls.includes('create'), false);
+  transition.resolve('');
+  assert.equal((await start).state, 'Running');
+  const stop = f.service.stopVpn();
+  await until(() => f.calls.includes('destroy'));
+  assert.equal(f.calls.includes('network-restored:17'), false);
+  destroy.resolve();
+  assert.equal((await stop).state, 'Stopped');
+  assert.ok(f.calls.indexOf('network-transition:17') < f.calls.indexOf('create'));
+  assert.ok(f.calls.indexOf('destroy') < f.calls.indexOf('network-restored:17'));
+});
+
+test('a management transition failure keeps platform ownership and is retried before creation or recovery', async () => {
+  let blocked = true;
+  const f = fixture({ transition: async () => blocked ? 'old download close unresolved' : '' });
+  const result = await f.service.startVpn();
+  assert.equal(result.state, 'CleanupFailed');
+  assert.equal(f.calls.includes('create'), false);
+  assert.equal(f.calls.includes('network-restored:17'), false);
+  blocked = false;
+  assert.equal((await f.service.stopVpn()).state, 'Stopped');
+  assert.equal(f.calls.filter(x => x === 'network-restored:17').length, 1);
+});
+
+test('failed system destroy cannot reopen management networking; successful retry can', async () => {
+  let fails = true;
+  const f = fixture({ destroy: async () => { if (fails) throw new Error('system destroy unknown'); } });
+  await f.service.startVpn();
+  assert.equal((await f.service.stopVpn()).state, 'CleanupFailed');
+  assert.equal(f.calls.includes('network-restored:17'), false);
+  fails = false;
+  assert.equal((await f.service.stopVpn()).state, 'Stopped');
+  assert.equal(f.calls.filter(x => x === 'network-restored:17').length, 1);
+});
+
+test('native restore rejection retains the same owner but does not repeat a successful system destroy', async () => {
+  let fails = true;
+  const f = fixture({ restore: () => fails ? 'old owner acknowledgement' : '' });
+  await f.service.startVpn();
+  assert.equal((await f.service.stopVpn()).state, 'CleanupFailed');
+  fails = false;
+  assert.equal((await f.service.stopVpn()).state, 'Stopped');
+  assert.equal(f.calls.filter(x => x === 'destroy').length, 1);
+  assert.equal(f.calls.filter(x => x === 'network-restored:17').length, 2);
+});
+
+test('stop during management transition never creates a VPN but acknowledges that registered owner', async () => {
+  const transition = deferred();
+  const f = fixture({ transition: () => transition.promise });
+  const start = f.service.startVpn();
+  await until(() => f.calls.includes('network-transition:17'));
+  const stop = f.service.stopVpn();
+  transition.resolve('');
+  assert.equal((await stop).state, 'Stopped');
+  await start;
+  assert.equal(f.calls.includes('create'), false);
+  assert.equal(f.calls.filter(x => x === 'network-restored:17').length, 1);
+});
+
+test('a destroy retry sharing a timed-out SDK promise acknowledges the platform owner exactly once', async () => {
+  const destroy = deferred();
+  const f = fixture({ timeoutMs: 15, destroy: () => destroy.promise });
+  await f.service.startVpn();
+  assert.equal((await f.service.stopVpn()).state, 'CleanupFailed');
+  const retry = f.service.stopVpn();
+  await until(() => f.calls.filter(x => x === 'network-transition:17').length === 3);
+  destroy.resolve();
+  assert.equal((await retry).state, 'Stopped');
+  assert.equal(f.calls.filter(x => x === 'destroy').length, 1);
+  assert.equal(f.calls.filter(x => x === 'network-restored:17').length, 1);
 });
 
 for (const [name, option, stage, hasConnection] of [

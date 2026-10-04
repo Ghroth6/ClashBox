@@ -3,7 +3,7 @@ import { getProfileDir, getProfilePath, getProfilesPath } from './appPath';
 import { Context } from '@kit.AbilityKit';
 import { ProxyGroup, ProxyType, SubscriptionInfo } from './models/Common';
 import { JSON, taskpool, util } from '@kit.ArkTS';
-import { http } from '@kit.NetworkKit';
+
 import { parse, stringify } from 'yaml'
 import { YamlUtils } from './utils/YamlUtils'
 import { YamlUtil } from './utils/YamlUtil';
@@ -42,6 +42,7 @@ export class Profile {
   customRules: string[] = []
   currentGroupName: string | null = null
   isUpdating: boolean = false
+  private writeRevision: number = 0
   autoUpdate: boolean = true
   lastUpdateDate: number
   autoUpdateDuration: number
@@ -84,6 +85,7 @@ export class Profile {
   }
 
   async delete(): Promise<void> {
+    this.writeRevision++
     if (!await this.check()) return
     const profileDir = await getProfilesPath(this.context)
     const profilePath = await getProfilePath(this.context, this.id);
@@ -105,33 +107,25 @@ export class Profile {
 
   async update(socketProxy: SocketProxyService, customRules: string[] = [], deleteRules: string[] = []): Promise<boolean> {
     console.debug(`[Profile] UpdateConfig started`);
+    const revision = ++this.writeRevision;
+    const requestUrl = this.url;
     const requestUa = this.globalUa ?? "clash-verge/v2.5.1";
-    const tempYamlPath = this.context?.tempDir + "/temp.yaml";
+    const tempYamlPath = this.context?.tempDir + "/subscription-" + this.id + "-" + generateUUID() + ".yaml";
 
     const maxRetries = 2;
     let lastError: Error | null = null;
-    // 原生 Go 下载器一旦失败（多为 TLS 证书问题），后续重试直接走系统 http 兜底，
-    // 避免每次重试都先经历一次原生失败等待，加快整体下载速度
-    let nativeFailed = false;
-
+    // All attempts use the native platform-aware path. NetworkKit does not
+    // expose the socket protection/completion contract required here.
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         let result: string;
-        if (!nativeFailed) {
-          try {
-            result = await socketProxy.downloadConfig(this.url, requestUa, tempYamlPath)
-          } catch (e) {
-            nativeFailed = true
-            // 原生 Go 下载器严格校验 TLS 证书（部分订阅源用自签名/私有 CA 证书会失败），
-            // 降级为系统 @ohos.net.http 模块兜底下载（走系统证书链），失败则抛出原错误
-            const nativeErr = e instanceof Error ? e.message : String(e)
-            console.warn(`[Profile] UpdateConfig 原生下载失败，尝试系统 HTTP 兜底: ${nativeErr}`)
-            result = await this.downloadConfigFallback(this.url, requestUa, tempYamlPath)
-          }
-        } else {
-          // 原生已确认失败（如 TLS 证书问题），重试直接走系统 http 兜底
-          result = await this.downloadConfigFallback(this.url, requestUa, tempYamlPath)
+        try {
+          result = await socketProxy.downloadConfig(requestUrl, requestUa, tempYamlPath)
+        } catch (e) {
+          const nativeErr = e instanceof Error ? e.message : String(e)
+          throw new Error('原生订阅下载失败；系统 HTTP 路径尚未验证，未启用兜底: ' + nativeErr)
         }
+        this.requireWriteRevision(revision, requestUrl)
         let disposition :string | undefined;
         let userinfo: string | undefined;
         try {
@@ -142,16 +136,6 @@ export class Profile {
           throw Error(result)
         }
         const parsedName = getFileNameFromDisposition(disposition);
-        if (parsedName) {
-          // disposition 是权威来源：即使重试期间被 URL 兜底污染也覆盖（如反爬页重试后拿到真实订阅）
-          this.name = parsedName;
-        } else if (!this.name || this.name == "") {
-          // disposition 缺失/解析失败时从 URL 提取名称，避免显示 UUID
-          this.name = this.getDefaultNameFromUrl(this.url) ?? this.id;
-        }
-        if (userinfo) {
-          this.subscriptionInfo = SubscriptionInfo.formHString(userinfo);
-        }
         console.debug(`[Profile] UpdateConfig this.name: ${this.name} userinfo: ${userinfo}`);
 
         let configContent = await fs.readText(tempYamlPath)
@@ -177,7 +161,11 @@ export class Profile {
 
           let finalStr = convertedYaml ? convertedYaml : configContent;
 
-          await this.save(finalStr, async (config)=> await socketProxy.vailConfig(config), customRules, deleteRules);
+          await this.save(finalStr, async (config)=> await socketProxy.vailConfig(config), customRules, deleteRules, '', revision, requestUrl);
+          this.requireWriteRevision(revision, requestUrl)
+          if (parsedName) this.name = parsedName
+          else if (!this.name) this.name = this.getDefaultNameFromUrl(requestUrl) ?? this.id
+          if (userinfo) this.subscriptionInfo = SubscriptionInfo.formHString(userinfo)
         // 清理备份配置
           this.cleanScriptBackup()
 
@@ -195,6 +183,10 @@ export class Profile {
           }
         } catch (_) {}
 
+        // An edit, deletion, new update or URL change supersedes this attempt;
+        // it must not retry with the new URL or publish the old response.
+        this.requireWriteRevision(revision, requestUrl)
+
         if (attempt < maxRetries) {
           console.warn(`[Profile] UpdateConfig 第${attempt}次下载失败: ${lastError.message}，${1000}ms后重试...`);
           await new Promise<void>(resolve => setTimeout(resolve, 1000));
@@ -208,87 +200,9 @@ export class Profile {
     throw new Error("下载配置失败");
   }
 
-  /**
-   * 原生 Go 下载器 TLS 证书校验失败的兜底下载：
-   * 使用系统 @ohos.net.http 模块（走系统证书链），将响应写入 tempYamlPath，
-   * 返回与原生 downloadConfig 一致的 JSON（content-disposition / subscription-userinfo）
-   */
-  private async downloadConfigFallback(url: string, ua: string, filePath: string): Promise<string> {
-    const httpRequest = http.createHttp()
-    // 确保内置的 Let's Encrypt YE1 中间证书可用（rawfile → 应用目录）：
-    // 部分订阅源服务器只发送叶子证书、缺失中间证书，导致链验证失败；
-    // 用 caPath 补全中间证书即可通过系统 http 模块的证书校验
-    let caFile = ''
-    try {
-      const baseDir = this.context?.filesDir ?? this.context?.tempDir ?? ''
-      const target = baseDir + '/int-ye1.pem'
-      if (baseDir !== '' && !await fs.access(target)) {
-        const raw = await this.context?.resourceManager.getRawFileContent('int-ye1.pem')
-        if (raw && raw.length > 0) {
-          const caFileHandle = await fs.open(target, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC)
-          const buffer: ArrayBuffer = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer
-          await fs.write(caFileHandle.fd, buffer)
-          await fs.close(caFileHandle.fd)
-        }
-      }
-      caFile = target
-    } catch (e) {
-      console.warn(`[Profile] 准备 CA 证书失败: ${(e as Error).message}`)
-    }
-    try {
-      const options: http.HttpRequestOptions = {
-        method: http.RequestMethod.GET,
-        connectTimeout: 20000,
-        readTimeout: 30000,
-        header: { 'User-Agent': ua }
-      }
-      if (caFile !== '') {
-        options.caPath = caFile
-      }
-      const resp = await httpRequest.request(url, options)
-      if (resp.responseCode !== 200) {
-        throw new Error(`HTTP ${resp.responseCode}`)
-      }
-      // 响应可能是 string 或 ArrayBuffer，统一转为字符串落盘
-      let content: string
-      if (typeof resp.result === 'string') {
-        content = resp.result
-      } else if (resp.result instanceof ArrayBuffer) {
-        const decoder = util.TextDecoder.create('utf-8', { ignoreBOM: true })
-        content = decoder.decodeToString(new Uint8Array(resp.result))
-      } else {
-        throw new Error('响应内容格式异常')
-      }
-      const bytes = utf8e.encodeInto(content)
-      const file = await fs.open(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC)
-      await fs.write(file.fd, bytes.buffer)
-      await fs.close(file.fd)
-      // 提取响应头（原生 downloadConfig 返回 JSON，含 content-disposition / subscription-userinfo）
-      const headers = (resp.header ?? {}) as Record<string, string | string[]>
-      const first = (v: string | string[] | undefined): string => {
-        if (v === undefined) return ''
-        return Array.isArray(v) ? (v[0] ?? '') : v
-      }
-      // HTTP 头键名大小写不敏感：系统 http 模块返回的 header 键可能是
-      // "Content-Disposition" 或 "content-disposition"，统一小写比较避免取不到
-      const getHeader = (name: string): string => {
-        const lower = name.toLowerCase()
-        const keys = Object.keys(headers)
-        for (let i = 0; i < keys.length; i++) {
-          if (keys[i].toLowerCase() === lower) {
-            return first(headers[keys[i]])
-          }
-        }
-        return ''
-      }
-      const configInfo: Record<string, string> = {}
-      const disposition = getHeader('content-disposition')
-      const userinfo = getHeader('subscription-userinfo')
-      if (disposition) configInfo['content-disposition'] = disposition
-      if (userinfo) configInfo['subscription-userinfo'] = userinfo
-      return JSON.stringify(configInfo)
-    } finally {
-      httpRequest.destroy()
+  private requireWriteRevision(revision: number, url: string = ''): void {
+    if (revision !== this.writeRevision || (url !== '' && this.url !== url)) {
+      throw new Error('配置已修改，旧订阅更新已取消')
     }
   }
 
@@ -321,7 +235,9 @@ export class Profile {
     vailConfig: (config: string) => Promise<string>,
     customRules: string[] = [],
     deleteRules: string[] = [],
-    scriptContent: string = ""): Promise<Profile> {
+    scriptContent: string = "", expectedRevision: number = -1, expectedUrl: string = ''): Promise<Profile> {
+    const revision = expectedRevision < 0 ? ++this.writeRevision : expectedRevision
+    this.requireWriteRevision(revision, expectedUrl)
     let rawStr: string;
     if (typeof raw == "string") {
       rawStr = raw;
@@ -337,29 +253,35 @@ export class Profile {
     // 编码并写入临时文件
     let bytes = utf8e.encodeInto(finalStr);
     const filePath = await getProfilePath(this.context, this.id);
-    const tempPath = this.context!.tempDir + "/temp.config";
-    const temp = await fs.open(tempPath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-    await fs.write(temp.fd, bytes.buffer);
-    await fs.close(temp.fd);
+    const tempPath = filePath + '.pending-' + generateUUID();
+    try {
+      const temp = await fs.open(tempPath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+      try {
+        const written = await fs.write(temp.fd, bytes.buffer);
+        if (written !== bytes.length) throw new Error('配置写入不完整')
+        await fs.fsync(temp.fd)
+      } finally {
+        await fs.close(temp.fd);
+      }
 
-    // 内核校验
-    console.debug(`[Profile][VailTrace] before vailConfig t=${Date.now()} path=${tempPath}`);
-    let message = await vailConfig(tempPath);
-    console.debug(`[Profile][VailTrace] after vailConfig t=${Date.now()} message=${message}`);
-    await fs.unlink(tempPath);
-    if (message != "") {
-      throw new Error(message);
+      console.debug(`[Profile][VailTrace] before vailConfig t=${Date.now()} path=${tempPath}`);
+      let message = await vailConfig(tempPath);
+      console.debug(`[Profile][VailTrace] after vailConfig t=${Date.now()} message=${message}`);
+      if (message != "") throw new Error(message);
+
+      // The validity check and rename are synchronous: a newer edit cannot enter
+      // between them. Validate a unique sibling, then publish its original bytes.
+      this.requireWriteRevision(revision, expectedUrl)
+      fs.renameSync(tempPath, filePath)
+      this.lastUpdateDate = new Date().getTime();
+      return this;
+    } finally {
+      try { await fs.unlink(tempPath) } catch (_) {}
     }
-
-    // 校验通过，写入正式文件
-    const file = await fs.open(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-    await fs.write(file.fd, bytes.buffer);
-    await fs.close(file.fd);
-    this.lastUpdateDate = new Date().getTime();
-    return this;
   }
 
   async saveByUri(uri: string, customRules: string[] = [], deleteRules: string[] = [], scriptContent: string = ""): Promise<Profile> {
+    this.writeRevision++
     const filePath = await getProfilePath(this.context, this.id);
     const src = await fs.open(uri, fs.OpenMode.READ_ONLY);
     let buffer: ArrayBuffer;
