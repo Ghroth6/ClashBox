@@ -12,7 +12,11 @@
 
 NetworkKit 从已连接的 INTERNET 非 VPN 网络取得真实接口、地址/前缀、MTU、路由及默认网络 DNS，发布完整且带代际的快照。首次采集失败阻止服务就绪；缺省或离线不采用公共 DNS fallback。未知 ifindex 明确为 0，不使用 netId 冒充。被动订阅仅监听默认网络，其它接口在默认网络事件或显式 start 时刷新。监视器随服务生存，服务销毁时清空快照。
 
-正常入口生命周期之外仍有待办：核心绑定错误仍只记录日志，部分构造失败回滚、已发送的原生启动请求取消、protect 通道断开清理、DNS/controller 与后台任务停机均未闭环；startListener 返回 true 不是所有端口已绑定的确认。尚未完成完整 ArkTS/HAP 构建、设备加载或真机验收。当前输入、产物与测试证据以协调仓 README、设计及检查点为准。
+代理监听启动现在检查核心实际 bind 结果，任一步失败都尝试关闭整个代理入口集合并返回失败；已登记对象的 close 错误保留诊断及重试所有权。底层部分构造失败会回滚，若 Close 自身失败则返回错误，不能保证资源已释放。startListener 仅在系统 TUN 已就绪且本批代理入口全部成功后返回 true。
+
+OHOS 启动在第一个 await 前取得原生代际令牌，IPC 携带令牌，停止后才接收的旧请求也会被拒绝。StopTun 先取消保护等待及其 IPC，再取得构造锁关闭监听和 TUN；构造期间保持系统 fd 生存边界，避免依赖阻塞在同步 NAPI 后的 ArkTS ACK。protect 通道断开仅清理所属实例，旧通道不能关闭新 TUN，也不能为新 VPN 重试或确认旧保护请求。应用停止直接调用 StopTun，避免先调用持同一锁的 stopListener。
+
+首次 TUN 预留前保留配置初始化网络活动；之后没有有效保护 owner 就拒绝新出站。DNS/controller/provider 后台任务仍未完整停止，系统 VPN destroy 尚无同步完成确认，因此停机后的后台下载也未恢复。完整 ArkTS/HAP、设备加载、实际 fd 回收及真机反复启停仍待验收。当前输入、产物与测试证据以协调仓 README、设计及检查点为准；tests/native-lifecycle 的实际函数宿主测试由协调仓 prepare-bridge-tests.py 准备，OS 构造器使用可控替身。
 
 新增平台快照和事件客户端的宿主测试为 `tests/network-snapshot.test.mjs` 与 `tests/stream-subscription.test.mjs`；使用工程声明的 IDE Node 运行 `--test`。这些测试执行生产模型和状态机，不替代 SDK/ArkTS 编译与设备运行。
 
