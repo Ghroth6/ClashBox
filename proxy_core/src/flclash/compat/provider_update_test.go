@@ -10,14 +10,16 @@ import (
 	"github.com/metacubex/mihomo/component/resource"
 	P "github.com/metacubex/mihomo/constant/provider"
 	rp "github.com/metacubex/mihomo/rules/provider"
+	"github.com/metacubex/mihomo/tunnel"
 )
 
 func TestSideUpdateReturnsActualProviderErrorsAndRejectsRetiredOwner(t *testing.T) {
-	hc := provider.NewHealthCheck(nil, "", 1000, 0, true, nil)
-	proxy, err := provider.NewProxySetProvider("proxy", 0, nil, nil, resource.NewFileVehicle(filepath.Join(t.TempDir(), "proxies.yaml")), hc)
+	home := geoHome(t)
+	parsed, err := provider.ParseProxyProvider("proxy", map[string]any{"type": "file", "path": filepath.Join(home, "proxies.yaml")}, tunnel.Tunnel)
 	if err != nil {
 		t.Fatal(err)
 	}
+	proxy := parsed.(*provider.ProxySetProvider)
 	defer proxy.Close()
 	rule := rp.NewRuleSetProvider("rule", P.Domain, P.YamlRule, 0, resource.NewFileVehicle(filepath.Join(t.TempDir(), "rules.yaml")), nil, nil, nil).(*rp.RuleSetProvider)
 	defer rule.Close()
