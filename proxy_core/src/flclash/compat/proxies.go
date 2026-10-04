@@ -17,11 +17,13 @@ type ProxyCatalog struct {
 	static  map[string]C.Proxy
 	items   map[string]C.Proxy
 	ids     map[C.Proxy]string
+	origins map[C.Proxy]P.ProxyProvider
 	aliases map[string][]string
 }
 
 func NewProxyCatalog(static map[string]C.Proxy, providers map[string]P.ProxyProvider) (*ProxyCatalog, error) {
 	c := &ProxyCatalog{static: map[string]C.Proxy{}, items: map[string]C.Proxy{}, ids: map[C.Proxy]string{}, aliases: map[string][]string{}}
+	c.origins = map[C.Proxy]P.ProxyProvider{}
 	for name, proxy := range static {
 		if proxy == nil {
 			continue
@@ -64,6 +66,7 @@ func NewProxyCatalog(static map[string]C.Proxy, providers map[string]P.ProxyProv
 			}
 			id := QualifiedProxyID(proxy.Name(), providerName, static)
 			c.items[id], c.ids[proxy] = proxy, id
+			c.origins[proxy] = provider
 			c.aliases[proxy.Name()] = append(c.aliases[proxy.Name()], id)
 		}
 	}
@@ -136,8 +139,8 @@ func (c *ProxyCatalog) Items() map[string]C.Proxy {
 	return items
 }
 
-// Select never chooses a provider node as a group. Official group setters use
-// bare names, so ambiguous membership is explicitly rejected even with an ID.
+// Select never chooses a provider node as a group. Ambiguous initial membership
+// is rejected; the core retains source identity across later provider refreshes.
 func (c *ProxyCatalog) Select(groupName, id string) error {
 	group := c.static[groupName]
 	if group == nil {
@@ -174,7 +177,11 @@ func (c *ProxyCatalog) Select(groupName, id string) error {
 	if count != 1 {
 		return fmt.Errorf("group %q has ambiguous members named %q; selection was not changed", groupName, proxy.Name())
 	}
-	return selector.Set(proxy.Name())
+	identitySelector, ok := selector.(outboundgroup.IdentitySelectAble)
+	if !ok {
+		return fmt.Errorf("group %q does not support identity-preserving selection", groupName)
+	}
+	return identitySelector.SetIdentity(proxy, c.origins[proxy])
 }
 
 func (c *ProxyCatalog) MarshalJSON() ([]byte, error) {
@@ -218,12 +225,19 @@ func (c *ProxyCatalog) MarshalJSON() ([]byte, error) {
 					matches++
 				}
 			}
-			if matches != 1 {
+			unavailable := false
+			if identitySelector, ok := group.(outboundgroup.IdentitySelectAble); ok {
+				// Now() is a display name. Resolve the actual object so a later
+				// duplicate in another provider cannot erase or relabel selection.
+				selected = c.ids[identitySelector.SelectedProxy()]
+				unavailable = selected == ""
+			} else if matches != 1 {
 				selected = ""
 			}
 			entry["all"], _ = json.Marshal(all)
 			entry["now"], _ = json.Marshal(selected)
 			entry["selectionAmbiguous"], _ = json.Marshal(matches > 1)
+			entry["selectionUnavailable"], _ = json.Marshal(unavailable)
 		}
 		result[id] = entry
 	}

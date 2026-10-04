@@ -107,7 +107,7 @@ func TestProxyCatalogPreservesStaticGroupsAndProviderObjects(t *testing.T) {
 	}
 	entries := catalogJSON(t, c)
 	wantAll := []string{c.ID(aShared), c.ID(aGroup), c.ID(unique), c.ID(aDup), c.ID(bDup)}
-	if !reflect.DeepEqual(entries["choice"].All, wantAll) || entries["choice"].Now != "" || !entries["choice"].SelectionAmbiguous {
+	if !reflect.DeepEqual(entries["choice"].All, wantAll) || entries["choice"].Now != c.ID(aDup) || !entries["choice"].SelectionAmbiguous {
 		t.Fatalf("group JSON did not preserve qualified membership/ambiguity: %+v", entries["choice"])
 	}
 	for id, entry := range entries {
