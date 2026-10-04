@@ -68,6 +68,14 @@ function offlineSnapshot(value: number): PlatformNetworkSnapshot {
   return { generation: value, networkId: 0, online: false, dns: [], interfaces: [] };
 }
 
+// SDK errors normally inherit Error. Preserve their identity, stack and code;
+// also retain messages from error-like objects or non-Error promise rejections.
+function networkError(error: Object): Error {
+  if (error instanceof Error) return error;
+  const message = (error as Error)?.message;
+  return new Error(typeof message === 'string' ? message : String(error));
+}
+
 function validIPv4(value: string): boolean {
   const parts = value.split('.');
   return parts.length === 4 && parts.every((part: string) =>
@@ -252,7 +260,7 @@ export class PlatformNetworkMonitor {
         this.dispose(run);
         this.publishOffline();
       }
-      throw error;
+      throw networkError(error as Object);
     }
   }
 
@@ -299,10 +307,11 @@ export class PlatformNetworkMonitor {
         this.publish(snapshot);
       } catch (error) {
         if (this.current(run) && revision !== run.revision) continue;
-        if (!this.current(run) || run.initializing) throw error;
-        this.dependencies.log('Network refresh failed: ' + (error as Error).message);
+        const failure = networkError(error as Object);
+        if (!this.current(run) || run.initializing) throw failure;
+        this.dependencies.log('Network refresh failed: ' + failure.message);
         this.publishOffline();
-        if (run.requiredWaiters > 0) throw error;
+        if (run.requiredWaiters > 0) throw failure;
       }
     }
   }
@@ -358,7 +367,7 @@ export class PlatformNetworkMonitor {
 
   private publishOffline(): void {
     try { this.publish(offlineSnapshot(nextGeneration())); }
-    catch (error) { this.dependencies.log('Unable to publish offline network: ' + (error as Error).message); }
+    catch (error) { this.dependencies.log('Unable to publish offline network: ' + networkError(error as Object).message); }
   }
 
   private dispose(run: NetworkRun): void {
@@ -380,7 +389,7 @@ export class PlatformNetworkMonitor {
           resolve();
         });
       } catch (error) {
-        this.dependencies.log('Network listener unregister failed: ' + (error as Error).message);
+        this.dependencies.log('Network listener unregister failed: ' + networkError(error as Object).message);
         resolve();
       }
     })).catch((error: Error) => this.dependencies.log('Network listener release failed: ' + error.message));

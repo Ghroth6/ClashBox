@@ -13,7 +13,7 @@ function load() {
   const sandbox = {
     connection: { NetCap: { NET_CAPABILITY_INTERNET: 12 }, NetBearType: { BEARER_VPN: 4 } },
     publishNetworkSnapshot: () => { throw new Error('tests must inject native publication'); },
-    console, exports: {},
+    console, Error, exports: {},
   };
   vm.createContext(sandbox);
   const code = stripTypeScriptTypes(input.replace(/^import .*;\r?\n/gm, '').replace(/^export /gm, ''), { mode: 'strip' });
@@ -264,6 +264,33 @@ test('initial registration, collection and native publication failures reject an
     await assert.rejects(monitor.start());
     assert.equal(state.publications.at(-1).online, false, mode);
     if (mode === 'collect' || mode === 'publish') await until(() => state.listeners[0].unregisterCalls === 1);
+  }
+});
+
+test('startup and explicit refresh retain Error identity and normalize other rejection messages', async () => {
+  const original = Object.assign(new Error('SDK denied network information'), { code: 201 });
+  for (const [rejection, message] of [
+    [original, original.message],
+    [{ message: 'SDK service disconnected', code: 2100002 }, 'SDK service disconnected'],
+    ['network collection interrupted', 'network collection interrupted'],
+    [null, 'null'],
+  ]) {
+    for (const phase of ['startup', 'refresh']) {
+      const { PlatformNetworkMonitor } = load();
+      const { state, dependencies } = fixture();
+      const monitor = new PlatformNetworkMonitor(dependencies);
+      if (phase === 'refresh') await monitor.start();
+      dependencies.getProperties = () => Promise.reject(rejection);
+      await assert.rejects(monitor.start(), error => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, message);
+        if (rejection === original) assert.equal(error, original, 'keep SDK error stack, identity and code');
+        return true;
+      });
+      assert.equal(state.publications.at(-1).online, false);
+      if (phase === 'refresh') assert.ok(state.logs.some(log => log.includes(message)));
+      monitor.stop();
+    }
   }
 });
 

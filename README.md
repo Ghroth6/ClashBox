@@ -16,6 +16,8 @@ NetworkKit 从已连接的 INTERNET 非 VPN 网络取得真实接口、地址/�
 
 新增平台快照和事件客户端的宿主测试为 `tests/network-snapshot.test.mjs` 与 `tests/stream-subscription.test.mjs`；使用工程声明的 IDE Node 运行 `--test`。这些测试执行生产模型和状态机，不替代 SDK/ArkTS 编译与设备运行。
 
+配置导入回归另见 `tests/profile-import.test.mjs`，覆盖普通 JSON、流式 YAML 原字节保留，以及识别出的资源包仍执行结构和路径限制。使用 IDE Node 运行 `scripts/check-client-arkts.mjs` 可检查 `NetworkSnapshot.ets` 与 `ProfileImport.ets`：它直接调用本机 SDK 的编译器和 ArkTS 1.1 检查器，分别输出诊断阶段、错误及警告；默认 SDK 位于 DevEco 标准安装目录，也可传入 `--sdk-ets-dir` 指定 SDK 的 `openharmony/ets`。该入口不依赖历史探针或其它工作副本，不生成 HAP。
+
 ## 上游原始说明
 
 以下保留上游原文，描述其自身产品与安装方式，不表示本派生分支已经提供相同的核心或安装包。

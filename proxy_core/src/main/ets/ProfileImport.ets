@@ -26,7 +26,14 @@ export function decodeProfileImport(input: Uint8Array): ImportedFile[] {
   if (!text.trimStart().startsWith('{')) {
     return [{ path: 'config.yaml', bytes: input }];
   }
-  const bundle = JSON.parse(text) as ProfileBundle;
+  let bundle: ProfileBundle;
+  try {
+    bundle = JSON.parse(text) as ProfileBundle;
+  } catch (_) {
+    // Flow-style YAML may also start with "{" without being JSON. This layer
+    // identifies resource bundles; configuration syntax belongs to the core.
+    return [{ path: 'config.yaml', bytes: input }];
+  }
   if (bundle.format !== 'clashbox-profile-bundle-v1') {
     // JSON is also valid YAML; ordinary Mihomo JSON stays byte-for-byte intact.
     return [{ path: 'config.yaml', bytes: input }];
