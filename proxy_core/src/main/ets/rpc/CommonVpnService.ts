@@ -69,27 +69,37 @@ export abstract class CommonVpnService{
     config.trustedApplications = requireAllowlist(true, 'AcceptSelected', config.trustedApplications ?? []);
     config.blockedApplications = undefined;
 
-    let tunFd = -1
+    const connection = vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext)
+    this.vpnConnection = connection
     try {
-      this.vpnConnection = vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext);
-      tunFd = await this.vpnConnection.create(config)
+      const tunFd = await connection.create(config)
+      if (this.vpnConnection !== connection) {
+        // Stop may have run while OS creation was pending. Destroy the late
+        // result too, without touching a later connection's ownership.
+        await connection.destroy()
+        return -1
+      }
       console.log("ClashVPN", `获取tunFd: ${tunFd}`)
       return tunFd;
     } catch (error) {
       console.log("ClashVPN", `Clash启动失败 ${error.message} => ${error.stack}` )
-      this.vpnConnection?.destroy()
+      if (this.vpnConnection === connection) this.vpnConnection = undefined
+      await connection.destroy()
       return -1
     }
   }
-  async protect(fd: number){
-    await this.vpnConnection?.protect(fd)
+  async protect(fd: number): Promise<void> {
+    if (!this.vpnConnection) {
+      throw new Error("VpnConnection not initialized, cannot protect fd=" + fd)
+    }
+    await this.vpnConnection.protect(fd)
   }
   abstract startVpn(): Promise<boolean>
   stopVpn(){
-    if(!this.vpnConnection){
-      this.vpnConnection = vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext);
+    if(this.vpnConnection){
+      this.vpnConnection.destroy()
+      this.vpnConnection = undefined
     }
-    this.vpnConnection?.destroy()
   }
 }
 
@@ -122,7 +132,6 @@ export function cidrToAddressWithPrefix(cidr: string): AddressWithPrefix | null 
   }
   return null
 }
-
 export function cidrToRoute(cidr: string): RouteInfo | null {
   let destination = cidrToAddressWithPrefix(cidr)
   if (destination == null) {
@@ -138,4 +147,3 @@ export function cidrToRoute(cidr: string): RouteInfo | null {
     isDefaultRoute: cidr == "0.0.0.0/0" || cidr == "::/0",
   }
 }
-

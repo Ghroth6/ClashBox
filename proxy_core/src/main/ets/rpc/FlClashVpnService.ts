@@ -75,34 +75,23 @@ export class FlClashVpnService extends CommonVpnService {
     }
   }
   /** 防止多次调用 stopVpn 导致 stopTun 重复执行 */
-  private isStopped: boolean = false
+  private isStopped: boolean = true
+  private isStarting: boolean = false
+  private startGeneration: number = 0
 
-  onRemoteMessage(code: number, data: (string | number | boolean)[]): Promise<string | number | boolean> {
-    // 根据code处理客户端的请求
-    return new Promise(async (resolve, reject) => {
-      switch (code) {
-        case ClashRpcType.startClash: {
-          this.ParseConfig() // Reject invalid scope before opening core listeners.
-          startListener()
-          this.startVpn().then((r) => {
-            resolve(r)
-          }).catch((e: Error) => {
-            reject(e)
-          })
-          break;
-        }
-        case ClashRpcType.stopClash: {
-          // ★ 先停止 tun 再停止 listener，防止 Go 内部清理和 stopTun() 竞争导致 NULL 指针崩溃
-          this.stopVpn()
-          stopListener()
-          resolve(true)
-          break;
-        }
-        default: {
-          resolve("不支持当前操作")
-        }
+  async onRemoteMessage(code: number, data: (string | number | boolean)[]): Promise<string | number | boolean> {
+    switch (code) {
+      case ClashRpcType.startClash: {
+        return await this.startVpn()
       }
-    })
+      case ClashRpcType.stopClash: {
+        this.stopVpn()
+        return true
+      }
+      default: {
+        return "不支持当前操作"
+      }
+    }
   }
 
   ParseConfig(): VpnConfig {
@@ -167,31 +156,32 @@ export class FlClashVpnService extends CommonVpnService {
     return vpnConfig;
   }
   override async startVpn(): Promise<boolean> {
-    // ★ 重置停止标记，允许下次 stopVpn 正常关闭资源
+    if (this.isStarting) return false
+    if (!this.isStopped) return true
+    this.isStarting = true
     this.isStopped = false
-    if (this.vpnConnection) {
-      this.vpnConnection.destroy()
-      this.vpnConnection = undefined
-      // 系统级 VPN 连接销毁后需要时间回收 TUN 路由/protect 通道，
-      // 立即重建（卡片冷启动→关闭→UI 再启动场景）会叠加残留状态，
-      // 后台大流量时 protect 超时 → 流量回环 → 代理与直连全断
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 500)
-      })
-    }
-    let config = this.ParseConfig();
-    let tunFd = -1
+    const generation = ++this.startGeneration
     try {
-      tunFd = await super.getTunFd(config)
-      if (tunFd > -1) {
-        await this.startClash(tunFd)
+      const config = this.ParseConfig()
+      const tunFd = await super.getTunFd(config)
+      if (generation !== this.startGeneration) return false
+      if (tunFd <= 0) {
+        throw new Error('系统未返回有效的 TUN 文件描述符')
       }
-      return tunFd > -1;
+      await this.startClash(tunFd)
+      if (generation !== this.startGeneration) return false
+      // The protect channel and native TUN must be ready before proxy ingress.
+      // The current core API logs bind errors; this is not a listener-ready ACK.
+      if (!startListener()) {
+        throw new Error('代理监听配置尚未就绪')
+      }
+      return true
     } catch (error) {
       console.error("ClashVPN  error ", error)
-      this.stopVpn()
-      stopListener()
+      if (generation === this.startGeneration) this.stopVpn()
       return false
+    } finally {
+      this.isStarting = false
     }
   }
 
@@ -249,6 +239,10 @@ export class FlClashVpnService extends CommonVpnService {
         }
       })
       tcp.connect({ address: { address: socketPath }, timeout: 1000 }).then(async () => {
+        if (settled || this.clashSocket !== tcp) {
+          fail(new Error('原生 TUN 启动已取消'))
+          return
+        }
         await tcp.send({ data: JSON.stringify({ method: ClashRpcType.startClash, params: [tunFd] }) })
       }).catch((error: Error) => fail(error))
     })
@@ -275,12 +269,14 @@ export class FlClashVpnService extends CommonVpnService {
   }
 
   stopVpn() {
+    this.startGeneration++
     if (this.isStopped) return
     this.isStopped = true
+    stopListener()
+    stopTun()
     this.clashSocket?.off('message')
     this.clashSocket?.close()
     this.clashSocket = undefined
-    stopTun()
     super.stopVpn()
   }
 

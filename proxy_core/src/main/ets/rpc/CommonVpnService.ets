@@ -69,15 +69,22 @@ export abstract class CommonVpnService{
     config.trustedApplications = requireAllowlist(true, 'AcceptSelected', config.trustedApplications ?? []);
     config.blockedApplications = undefined;
 
-    let tunFd = -1
+    const connection = vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext)
+    this.vpnConnection = connection
     try {
-      this.vpnConnection = vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext);
-      tunFd = await this.vpnConnection.create(config)
+      const tunFd = await connection.create(config)
+      if (this.vpnConnection !== connection) {
+        // Stop may have run while OS creation was pending. Destroy the late
+        // result too, without touching a later connection's ownership.
+        await connection.destroy()
+        return -1
+      }
       console.log("ClashVPN", `获取tunFd: ${tunFd}`)
       return tunFd;
     } catch (error) {
       console.log("ClashVPN", `Clash启动失败 ${error.message} => ${error.stack}` )
-      this.vpnConnection?.destroy()
+      if (this.vpnConnection === connection) this.vpnConnection = undefined
+      await connection.destroy()
       return -1
     }
   }

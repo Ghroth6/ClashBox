@@ -26,7 +26,8 @@ export const getRequestList: () => string;
 export const clearRequestList: () => string;
 export const registerMessage: (callback: (message: string, value: string) => void) => void;
 export const startLog: (callback: (message: string, value: string) => void) => string;
-export const startListener: () => void
+// False means no configuration or a listener parse error; true is not a bind ACK.
+export const startListener: () => boolean
 export const stopListener: () => void
 export const stopLog: () => void;
 export const startIpc: (path) => void;

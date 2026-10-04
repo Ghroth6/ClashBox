@@ -12,7 +12,6 @@ import (
 	"sync"
 
 	"github.com/metacubex/mihomo/adapter"
-	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/common/batch"
@@ -24,6 +23,7 @@ import (
 	"github.com/metacubex/mihomo/hub"
 	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/listener"
+	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/log"
 	rp "github.com/metacubex/mihomo/rules/provider"
 	"github.com/metacubex/mihomo/tunnel"
@@ -179,6 +179,9 @@ func overwriteConfig(targetConfig *config.RawConfig, _ config.RawConfig) error {
 	if !targetConfig.DNS.Enable {
 		return errors.New("VPN profile requires dns.enable: true; imported DNS was not changed")
 	}
+	if targetConfig.IPTables.Enable {
+		return errors.New("VPN profile cannot enable iptables; the system VPN owns routing")
+	}
 	for _, inbound := range targetConfig.Listeners {
 		if inbound["type"] == "tun" {
 			return errors.New("VPN profile cannot create a named TUN listener; the system VPN owns TUN")
@@ -222,36 +225,29 @@ func patchConfig() {
 	})
 }
 
-func updateListeners(force bool) {
+func updateListeners(force bool) error {
 	if !isRunning || currentConfig == nil {
-		return
+		return nil
 	}
-	general := currentConfig.General
-	listeners := currentConfig.Listeners
-	if force == true {
+	runtime, err := compat.FreshProxyListeners(currentConfig, currentRawListeners)
+	if err != nil {
+		return err
+	}
+	if force {
 		stopListeners()
 	}
-	listener.PatchInboundListeners(listeners, tunnel.Tunnel, true)
-	listener.SetAllowLan(general.AllowLan)
-	inbound.SetSkipAuthPrefixes(general.SkipAuthPrefixes)
-	inbound.SetAllowedIPs(general.LanAllowedIPs)
-	inbound.SetDisAllowedIPs(general.LanDisAllowedIPs)
-	listener.SetBindAddress(general.BindAddress)
-	listener.ReCreateHTTP(general.Port, tunnel.Tunnel)
-	listener.ReCreateSocks(general.SocksPort, tunnel.Tunnel)
-	listener.ReCreateRedir(general.RedirPort, tunnel.Tunnel)
-	listener.ReCreateTProxy(general.TProxyPort, tunnel.Tunnel)
-	listener.ReCreateMixed(general.MixedPort, tunnel.Tunnel)
-	listener.ReCreateShadowSocks(general.ShadowSocksConfig, tunnel.Tunnel)
-	listener.ReCreateVmess(general.VmessConfig, tunnel.Tunnel)
-	listener.ReCreateTuic(general.TuicServer, tunnel.Tunnel)
+	compat.StartProxyListeners(runtime)
 	if !systemOwnsTUN {
-		listener.ReCreateTun(general.Tun, tunnel.Tunnel)
+		listener.ReCreateTun(currentConfig.General.Tun, tunnel.Tunnel)
 	}
+	return nil
 }
 
 func stopListeners() {
-	listener.StopListener()
+	compat.StopProxyListeners()
+	if !systemOwnsTUN {
+		listener.ReCreateTun(LC.Tun{}, tunnel.Tunnel)
+	}
 }
 
 func patchSelectGroup() {
@@ -287,14 +283,15 @@ func applyConfig(rawConfig *config.RawConfig) error {
 		return err // Keep the previous config; never apply a broad default on failure.
 	}
 	currentConfig = nextConfig
+	currentRawListeners = rawConfig.Listeners
 	if configParams.IsPatch {
 		patchConfig()
 	} else {
 		handleCloseConnectionsUnLock()
 		runtime.GC()
-		hub.ApplyConfig(currentConfig)
+		// Do not let executor open proxy ingress before the app's lifecycle gate.
+		hub.ApplyConfig(compat.ConfigWithoutProxyListeners(currentConfig))
 		patchSelectGroup()
 	}
-	updateListeners(false)
-	return err
+	return updateListeners(false)
 }

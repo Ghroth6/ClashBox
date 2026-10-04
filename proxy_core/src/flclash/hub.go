@@ -22,7 +22,6 @@ import (
 	"github.com/metacubex/mihomo/constant"
 	cp "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/hub/executor"
-	"github.com/metacubex/mihomo/listener"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
@@ -36,14 +35,15 @@ type healthCheckTarget struct {
 }
 
 var (
-	isInit             = false
-	configParams       = ConfigExtendedParams{}
-	externalProviders  = map[string]cp.Provider{}
-	logSubscriber      observable.Subscription[log.Event]
-	logStop            chan struct{}
-	currentConfig      *config.Config
-	healthCheckMu      sync.Mutex
-	healthCheckRunning bool
+	isInit              = false
+	configParams        = ConfigExtendedParams{}
+	externalProviders   = map[string]cp.Provider{}
+	logSubscriber       observable.Subscription[log.Event]
+	logStop             chan struct{}
+	currentConfig       *config.Config
+	currentRawListeners []map[string]any
+	healthCheckMu       sync.Mutex
+	healthCheckRunning  bool
 )
 
 func handleInitClash(homeDirStr string) bool {
@@ -57,8 +57,18 @@ func handleInitClash(homeDirStr string) bool {
 func handleStartListener() bool {
 	runLock.Lock()
 	defer runLock.Unlock()
+	if currentConfig == nil {
+		return false
+	}
+	if isRunning {
+		return true
+	}
 	isRunning = true
-	updateListeners(true)
+	if err := updateListeners(true); err != nil {
+		isRunning = false
+		log.Errorln("Start proxy listeners: %s", err)
+		return false
+	}
 	return true
 }
 
@@ -66,7 +76,7 @@ func handleStopListener() bool {
 	runLock.Lock()
 	defer runLock.Unlock()
 	isRunning = false
-	listener.StopListener()
+	stopListeners()
 	return true
 }
 
@@ -82,6 +92,9 @@ func handleForceGc() {
 }
 
 func handleShutdown() bool {
+	runLock.Lock()
+	defer runLock.Unlock()
+	isRunning = false
 	stopListeners()
 	executor.Shutdown()
 	runtime.GC()
@@ -450,27 +463,22 @@ func handleGetConnections() string {
 }
 
 func handleCloseConnectionsUnLock() bool {
+	allClosed := true
 	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
 		err := c.Close()
 		if err != nil {
-			return false
+			allClosed = false
+			log.Warnln("Close connection: %s", err)
 		}
 		return true
 	})
-	return true
+	return allClosed
 }
 
 func handleCloseConnections() bool {
 	runLock.Lock()
 	defer runLock.Unlock()
-	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
-		err := c.Close()
-		if err != nil {
-			return false
-		}
-		return true
-	})
-	return true
+	return handleCloseConnectionsUnLock()
 }
 
 func handleCloseConnection(connectionId string) bool {

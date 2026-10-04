@@ -230,8 +230,7 @@ func clearRequestList(env js.Env, this js.Value, args []js.Value) any {
 	return env.ValueOf("")
 }
 func startListener(env js.Env, this js.Value, args []js.Value) any {
-	handleStartListener()
-	return env.ValueOf("")
+	return handleStartListener()
 }
 func stopListener(env js.Env, this js.Value, args []js.Value) any {
 	handleStopListener()

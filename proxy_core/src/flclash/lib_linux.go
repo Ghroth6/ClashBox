@@ -38,11 +38,9 @@ var (
 	tunListener   *sing_tun.Listener
 	counter       int64 = 0
 	processMap    ProcessMap
-	tunLock       sync.Mutex
 	runTime       *time.Time
 	errBlocked    = errors.New("blocked")
 	keepaliveStop chan struct{}
-	keepaliveOnce sync.Once
 )
 
 func (cm *ProcessMap) Store(key int64, value string) {
@@ -58,8 +56,8 @@ func (cm *ProcessMap) Load(key int64) (string, bool) {
 }
 
 func StartTUN(fd int, markSocket func(Fd)) error {
-	tunLock.Lock()
-	defer tunLock.Unlock()
+	runLock.Lock()
+	defer runLock.Unlock()
 	if fd <= 0 {
 		return errors.New("invalid system TUN descriptor")
 	}
@@ -83,10 +81,6 @@ func StartTUN(fd int, markSocket func(Fd)) error {
 }
 
 func startKeepalive() {
-	keepaliveOnce.Do(func() {
-		keepaliveStop = make(chan struct{})
-	})
-	// 先停止已有保活
 	stopKeepalive()
 	keepaliveStop = make(chan struct{})
 	stop := keepaliveStop
@@ -97,20 +91,18 @@ func startKeepalive() {
 		for {
 			select {
 			case <-ticker.C:
-				// 直连模式下不需要健康检查和空闲连接清理
-				if currentConfig != nil && string(currentConfig.General.Mode) == "direct" {
-					continue
-				}
-				// 仅在有活跃连接时才做健康检查, 无流量时跳过以降低功耗
-				connSnapshot := statistic.DefaultManager.Snapshot()
-				if compat.ConnectionCount(connSnapshot) > 0 {
-					go handleHealthCheckAll()
-				}
 				func() {
 					runLock.Lock()
 					defer runLock.Unlock()
-					if tunListener == nil {
+					// A queued tick from an earlier TUN must not act on a new run.
+					if tunListener == nil || keepaliveStop != stop || currentConfig == nil {
 						return
+					}
+					if string(currentConfig.General.Mode) == "direct" {
+						return
+					}
+					if compat.ConnectionCount(statistic.DefaultManager.Snapshot()) > 0 {
+						go handleHealthCheckAll()
 					}
 					// 关闭所有空闲连接，强制 NAT 重新建立映射
 					n := 0
@@ -143,18 +135,20 @@ func stopKeepalive() {
 			close(keepaliveStop)
 		}
 	}
-	keepaliveOnce = sync.Once{}
+	keepaliveStop = nil
 }
 
 func GetRunTime() string {
-	tunLock.Lock()
-	defer tunLock.Unlock()
+	runLock.Lock()
+	defer runLock.Unlock()
 	if runTime == nil {
 		return "clash服务未启动"
 	}
 	return strconv.FormatInt(runTime.UnixMilli(), 10)
 }
 func ConfigInited() string {
+	runLock.Lock()
+	defer runLock.Unlock()
 	if currentConfig != nil {
 		return "true"
 	}
@@ -162,9 +156,12 @@ func ConfigInited() string {
 }
 
 func StopTun() {
-	tunLock.Lock()
-	defer tunLock.Unlock()
+	runLock.Lock()
+	defer runLock.Unlock()
 	stopKeepalive()
+	isRunning = false
+	stopListeners()
+	handleCloseConnectionsUnLock()
 	runTime = nil
 	if tunListener != nil {
 		_ = tunListener.Close()
@@ -242,8 +239,8 @@ func GetCurrentProfileName() string {
 }
 
 func GetVpnOptions() string {
-	tunLock.Lock()
-	defer tunLock.Unlock()
+	runLock.Lock()
+	defer runLock.Unlock()
 	port := 7980
 	if currentConfig != nil {
 		port = currentConfig.General.MixedPort
