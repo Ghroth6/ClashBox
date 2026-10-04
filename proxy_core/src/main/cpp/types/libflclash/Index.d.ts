@@ -3,7 +3,9 @@ export const initClash: (path: string, version: string) => void;
 export const startTun: (fd: number, callback: (id: number, fd: number) => void) => string;
 export const getVpnOptions: () => string;
 export const setFdMap: (fd: number) => void;
-export const stopTun: () => void;
+// Empty means listener/TUN cleanup reported no error; nonempty is unresolved.
+// This result does not confirm that the system VPN has been destroyed.
+export const stopTun: () => string;
 export const getTunStartToken: () => string;
 export const forceGc: () => void;
 export const validateConfig: (paramsString: string) => Promise<string>;
@@ -29,7 +31,7 @@ export const clearRequestList: () => string;
 export const registerMessage: (callback: (message: string, value: string) => void) => string | void;
 export const unregisterMessage: () => void;
 export const startLog: (callback: (message: string, value: string) => void) => string;
-// False means no configuration or a listener parse error; true is not a bind ACK.
+// True means the system TUN is ready and all configured proxy listeners bound.
 export const startListener: () => boolean
 export const stopListener: () => void
 export const stopLog: () => void;

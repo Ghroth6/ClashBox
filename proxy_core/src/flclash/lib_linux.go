@@ -33,14 +33,18 @@ type ProcessMap struct {
 }
 
 var (
-	tunListener     *sing_tun.Listener
-	tunOwner        *tunSession // protected by runLock, including a pending constructor
-	protectionOwner atomic.Pointer[tunSession]
-	counter         int64 = 0
-	processMap      ProcessMap
-	runTime         *time.Time
-	errBlocked      = errors.New("blocked")
-	keepaliveStop   chan struct{}
+	tunListener *sing_tun.Listener
+	tunOwner    *tunSession // protected by runLock, including a pending constructor
+	// TUN constructors/Close do not expose a reliable retry contract. Keep an
+	// uncertain result sticky instead of closing a possibly recycled fd again.
+	tunCleanupErr      error
+	listenerCleanupErr error // StopProxyListeners retains failed objects for retry.
+	protectionOwner    atomic.Pointer[tunSession]
+	counter            int64 = 0
+	processMap         ProcessMap
+	runTime            *time.Time
+	errBlocked         = errors.New("blocked")
+	keepaliveStop      chan struct{}
 )
 
 func (cm *ProcessMap) Store(key int64, value string) {
@@ -65,10 +69,13 @@ func StartTUN(fd int, owner *tunSession, markSocket func(Fd)) error {
 	// ACK blocked behind synchronous NAPI Stop.
 	runLock.Lock()
 	defer runLock.Unlock()
+	if err := errors.Join(tunCleanupErr, listenerCleanupErr); err != nil {
+		return fmt.Errorf("native cleanup is unresolved: %w", err)
+	}
 	if currentConfig == nil {
 		return errors.New("configuration is not loaded")
 	}
-	if tunOwner != nil || !tunSessions.Reserve(owner, markSocket) {
+	if tunListener != nil || tunOwner != nil || !tunSessions.Reserve(owner, markSocket) {
 		return errors.New("TUN start was cancelled or a TUN is already running")
 	}
 	tunOwner = owner
@@ -77,25 +84,26 @@ func StartTUN(fd int, owner *tunSession, markSocket func(Fd)) error {
 	options.DNSHijack = append([]string(nil), options.DNSHijack...)
 	listener, err := t.Start(fd, options.Device, options.Stack, options.DNSHijack)
 	if err != nil {
-		if tunOwner == owner {
-			tunOwner = nil
-		}
 		tunSessions.Cancel(owner)
 		protectionOwner.CompareAndSwap(owner, nil)
-		return err
-	}
-	if tunOwner != owner || !tunSessions.Commit(owner) {
-		if tunOwner == owner {
-			tunOwner = nil
-		}
-		tunSessions.Cancel(owner)
-		protectionOwner.CompareAndSwap(owner, nil)
-		// Only close a listener returned by a successful constructor. Ownership
-		// of a raw descriptor rejected before construction stays with the caller.
-		_ = listener.Close()
-		return errors.New("TUN start was cancelled")
+		// The constructor may have consumed fd and attempted rollback before
+		// returning no listener. Its error cannot prove either release or a leak.
+		// Keep this owner even without a handle; system destroy alone does not
+		// establish that every native resource was released.
+		tunListener = listener
+		tunCleanupErr = fmt.Errorf("TUN construction failed; native cleanup cannot be confirmed: %w", err)
+		return tunCleanupErr
 	}
 	tunListener = listener
+	if tunOwner != owner || !tunSessions.Commit(owner) {
+		tunSessions.Cancel(owner)
+		protectionOwner.CompareAndSwap(owner, nil)
+		closeErr := closeTunLocked()
+		if closeErr == nil {
+			tunOwner = nil
+		}
+		return errors.Join(errors.New("TUN start was cancelled"), closeErr)
+	}
 	now := time.Now()
 	runTime = &now
 	startKeepalive()
@@ -177,41 +185,60 @@ func ConfigInited() string {
 	return "false"
 }
 
-func StopTun() {
+func StopTun() error {
 	// Invalidate requests captured before Stop, even when their handler has not
 	// reached StartTUN yet. This also releases pending protect waits immediately.
 	tunSessions.CancelAll()
 	runLock.Lock()
 	defer runLock.Unlock()
 	tunSessions.Cancel(tunOwner)
-	stopTunLocked()
+	return stopTunLocked()
 }
 
-func StopTunOwner(owner *tunSession) {
+func StopTunOwner(owner *tunSession) error {
 	// A disconnected old stream must never shut down a replacement session.
 	tunSessions.Cancel(owner)
 	runLock.Lock()
 	defer runLock.Unlock()
 	if tunOwner != owner || owner == nil {
-		return
+		return nil
 	}
-	stopTunLocked()
+	return stopTunLocked()
 }
 
-func stopTunLocked() {
+func stopTunLocked() error {
 	protectionOwner.CompareAndSwap(tunOwner, nil)
-	tunOwner = nil
 	stopKeepalive()
 	stopCoreEvents()
 	isRunning = false
-	stopListeners()
+	listenerCleanupErr = stopListeners()
 	handleCloseConnectionsUnLock()
 	runTime = nil
-	if tunListener != nil {
-		_ = tunListener.Close()
-		tunListener = nil
-	}
+	tunErr := closeTunLocked()
 	compat.FlushDNS()
+	err := errors.Join(listenerCleanupErr, tunErr)
+	if err == nil {
+		tunOwner = nil
+	}
+	return err
+}
+
+// Called only under runLock. Retrying the aggregate TUN Close could close a
+// descriptor already recycled after a partial failure, or return nil merely
+// because an inner component considers itself closed. Neither proves cleanup.
+func closeTunLocked() error {
+	if tunCleanupErr != nil {
+		return tunCleanupErr
+	}
+	if tunListener == nil {
+		return nil
+	}
+	if err := tunListener.Close(); err != nil {
+		tunCleanupErr = fmt.Errorf("TUN close failed; native cleanup cannot be confirmed: %w", err)
+		return tunCleanupErr
+	}
+	tunListener = nil
+	return nil
 }
 
 func SetFdMap(fd C.long) { acknowledgeProtectedSocket(int64(fd)) }

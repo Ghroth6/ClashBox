@@ -36,8 +36,10 @@ func startTun(env js.Env, this js.Value, args []js.Value) any {
 	return ""
 }
 func stopTun(env js.Env, this js.Value, args []js.Value) any {
-	StopTun()
-	return nil
+	if err := StopTun(); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func getTunStartToken(env js.Env, this js.Value, args []js.Value) any {

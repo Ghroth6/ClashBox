@@ -347,7 +347,9 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		}
 		fn(ret)
 	case StopClash:
-		StopTun()
+		if err := StopTun(); err != nil {
+			ret.Error = err.Error()
+		}
 		fn(ret)
 	case VpnOptions:
 		ret.Result = GetVpnOptions()
