@@ -5,19 +5,38 @@ import (
 	"core/compat"
 	"errors"
 	"fmt"
+	"runtime"
+	"time"
+
 	"github.com/metacubex/mihomo/config"
 	cp "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/hub"
 	"github.com/metacubex/mihomo/hub/executor"
-	"runtime"
-	"time"
 )
+
+// Guarded by runLock. An error can retain an unfinished candidate cleanup;
+// subsequent calls wait for that same operation instead of closing it again.
+var pendingCandidateCleanup error
+
+func waitCandidateCleanup(ctx context.Context) error {
+	if err := config.WaitCleanup(ctx, pendingCandidateCleanup); err != nil {
+		return fmt.Errorf("previous candidate cleanup has not completed: %w", err)
+	}
+	pendingCandidateCleanup = nil
+	return nil
+}
 
 func applyConfig(rawConfig *config.RawConfig, params ConfigExtendedParams) error {
 	runLock.Lock()
 	defer runLock.Unlock()
 	if isRunning || systemTUNActiveLocked() {
 		return errors.New("stop the system VPN before replacing its configuration")
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err := waitCandidateCleanup(cleanupCtx)
+	cleanupCancel()
+	if err != nil {
+		return err
 	}
 	if err := stopListeners(); err != nil {
 		isRunning = false
@@ -45,12 +64,19 @@ func applyConfig(rawConfig *config.RawConfig, params ConfigExtendedParams) error
 	// successful reload; silently reviving retired objects would be unsafe.
 	nextConfig, err := config.ParseRawConfig(rawConfig)
 	if err != nil {
+		pendingCandidateCleanup = err
 		return err
 	}
 	eventIDs.Store(compat.NewEventIDs(nextConfig.Proxies, nextConfig.Providers))
 	startCoreEvents()
 	if err := hub.ApplyConfigContext(context.Background(), compat.ConfigWithoutProxyListeners(nextConfig)); err != nil {
-		return err
+		// ApplyConfigContext returns errors before publication. This candidate
+		// has no other owner; preserve any incomplete cleanup in the error.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		pendingCandidateCleanup = errors.Join(err, nextConfig.Discard(cleanupCtx))
+		eventIDs.Store(compat.NewEventIDs(nil, nil))
+		return pendingCandidateCleanup
 	}
 	configParams = params
 	currentConfig = nextConfig
@@ -75,7 +101,7 @@ func handleShutdown() bool {
 	err = errors.Join(err, executor.CancelConfigTasks(nil))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err = errors.Join(err, configurationTasks.Wait(ctx))
+	err = errors.Join(err, waitCandidateCleanup(ctx), configurationTasks.Wait(ctx))
 	if err != nil {
 		return false
 	}

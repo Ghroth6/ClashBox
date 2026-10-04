@@ -10,6 +10,7 @@ import (
 	"core/compat"
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
+	"github.com/metacubex/mihomo/component/configresources"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
@@ -31,6 +32,7 @@ func reset(t *testing.T) {
 	C.SetHomeDir(t.TempDir())
 	currentConfig = nil
 	configurationTasks = nil
+	pendingCandidateCleanup = nil
 	isRunning, tunActive, stopError = false, false, nil
 	if err := compat.ConfigureForwarding(); err != nil {
 		t.Fatal(err)
@@ -40,7 +42,71 @@ func reset(t *testing.T) {
 		configurationTasks.Cancel()
 		_ = executor.RetireConfig(context.Background())
 		C.SetHomeDir(oldHome)
+		pendingCandidateCleanup = nil
 	})
+}
+
+type candidateCloseProbe struct {
+	*outbound.Base
+	started chan struct{}
+	release chan struct{}
+	err     error
+	calls   atomic.Int32
+}
+
+func (p *candidateCloseProbe) Close() error {
+	p.calls.Add(1)
+	close(p.started)
+	if p.release != nil {
+		<-p.release
+	}
+	return p.err
+}
+
+func TestUnfinishedCandidateCleanupBlocksReloadAndCanContinueWaiting(t *testing.T) {
+	reset(t)
+	probe := &candidateCloseProbe{Base: outbound.NewBase(outbound.BaseOption{Name: "candidate", Type: C.Direct}), started: make(chan struct{}), release: make(chan struct{})}
+	owned := &configresources.Set{}
+	owned.AddAdapter(probe)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	pendingCandidateCleanup = errors.Join(errors.New("invalid candidate"), owned.Close(ctx))
+	<-probe.started
+	result := make(chan error, 1)
+	raw := fixture(t)
+	go func() { result <- applyConfig(raw, ConfigExtendedParams{}) }()
+	select {
+	case err := <-result:
+		t.Fatalf("reload skipped pending cleanup: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(probe.release)
+	if err := <-result; err != nil {
+		t.Fatalf("cleanup completion did not permit reload: %v", err)
+	}
+	if probe.calls.Load() != 1 || pendingCandidateCleanup != nil || currentConfig == nil {
+		t.Fatal("cleanup retried Close or candidate not published")
+	}
+}
+
+func TestCandidateCloseFailureRemainsBlockingForReloadAndShutdown(t *testing.T) {
+	reset(t)
+	closeErr := errors.New("candidate socket close failed")
+	probe := &candidateCloseProbe{Base: outbound.NewBase(outbound.BaseOption{Name: "candidate", Type: C.Direct}), started: make(chan struct{}), err: closeErr}
+	owned := &configresources.Set{}
+	owned.AddAdapter(probe)
+	pendingCandidateCleanup = errors.Join(errors.New("invalid candidate"), owned.Close(context.Background()))
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := applyConfig(fixture(t), ConfigExtendedParams{}); !errors.Is(err, closeErr) {
+			t.Fatalf("lost cleanup failure: %v", err)
+		}
+	}
+	if handleShutdown() {
+		t.Fatal("shutdown ignored candidate cleanup failure")
+	}
+	if probe.calls.Load() != 1 || currentConfig != nil {
+		t.Fatal("failed close retried or configuration activated")
+	}
 }
 
 func TestReplacementWaitsForOldRequestBeforeParsing(t *testing.T) {
