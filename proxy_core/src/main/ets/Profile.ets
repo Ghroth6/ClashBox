@@ -110,13 +110,13 @@ export class Profile {
     const revision = ++this.writeRevision;
     const requestUrl = this.url;
     const requestUa = this.globalUa ?? "clash-verge/v2.5.1";
-    const tempYamlPath = this.context?.tempDir + "/subscription-" + this.id + "-" + generateUUID() + ".yaml";
 
     const maxRetries = 2;
     let lastError: Error | null = null;
     // All attempts use the native platform-aware path. NetworkKit does not
     // expose the socket protection/completion contract required here.
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const tempYamlPath = this.context?.tempDir + "/subscription-" + this.id + "-" + generateUUID() + ".yaml";
       try {
         let result: string;
         try {

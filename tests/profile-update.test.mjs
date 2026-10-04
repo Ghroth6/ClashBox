@@ -60,9 +60,11 @@ test('native subscription failure remains visible and never invokes unverified N
   const f = await fixture(t), p = f.make('native');
   await p.save('previous', async () => '');
   let requests = 0;
-  f.rpc.downloadConfig = async () => { requests++; throw new Error('management network is transitioning'); };
+  const destinations = [];
+  f.rpc.downloadConfig = async (_url, _ua, target) => { requests++; destinations.push(target); throw new Error('management network is transitioning'); };
   await assert.rejects(p.update(f.rpc), /系统 HTTP 路径尚未验证.*management network is transitioning/);
   assert.equal(requests, 2);
+  assert.equal(new Set(destinations).size, 2);
   assert.equal(await f.read('native'), 'previous');
 });
 

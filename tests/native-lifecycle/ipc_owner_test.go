@@ -9,6 +9,37 @@ import (
 	"time"
 )
 
+// Same wire value as the production enum; the extraction harness substitutes
+// only business dispatch, while running handleConnection verbatim.
+const DownloadConfig ClashRpcType = 29
+
+func TestIPCDownloadDisconnectCancelsItsOriginalAttempt(t *testing.T) {
+	entered, finished := make(chan struct{}), make(chan struct{})
+	requestHandler = func(r RpcRequest, fn func(RpcResult)) {
+		if r.ctx == nil {
+			t.Error("download has no connection lifetime")
+			return
+		}
+		close(entered)
+		<-r.ctx.Done()
+	}
+	server, client := net.Pipe()
+	defer client.Close()
+	go func() { handleConnection(server); close(finished) }()
+	_ = client.SetDeadline(time.Now().Add(time.Second))
+	request, _ := json.Marshal(RpcRequest{Method: DownloadConfig, Params: []any{"https://example.test", "ua", "unique.tmp"}})
+	if _, err := client.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	_ = client.Close()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("disconnected download still owns its destination")
+	}
+}
+
 func TestIPCStartReceivedBeforeStopDoesNotAcquireNewGeneration(t *testing.T) {
 	tunSessions.CancelAll()
 	defer tunSessions.CancelAll()

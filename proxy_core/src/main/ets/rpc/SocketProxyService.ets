@@ -355,7 +355,9 @@ export class SocketProxyService implements IClashManager {
         parseMessage(fullMessage)
       })
       const lifecycleRequest = method === ClashRpcType.startClash || method === ClashRpcType.stopClash
-      const rpcTimeout = lifecycleRequest ? 40000 : (method === ClashRpcType.downloadConfig ? 15000 : 10000)
+      // Native subscription attempts are bounded by 20 seconds. Give their
+      // cancellation/error response time to arrive before abandoning the RPC.
+      const rpcTimeout = lifecycleRequest ? 40000 : (method === ClashRpcType.downloadConfig ? 25000 : 10000)
       timeoutId = setTimeout(()=>{
         if (timeout) {
           timeout = false

@@ -89,6 +89,14 @@ func handleConnectionAtGeneration(conn net.Conn, generation uint64) {
 		}
 	}
 	var disconnected chan struct{}
+	if request.Method == DownloadConfig {
+		ctx, cancel := context.WithCancel(context.Background())
+		request.ctx = ctx
+		defer cancel()
+		// A timed-out/closed RPC no longer owns its temporary destination. Stop
+		// the original download instead of letting it race a later retry.
+		go func() { _, _ = io.Copy(io.Discard, conn); cancel() }()
+	}
 	if request.Method == StartClash {
 		if len(request.Params) == 2 {
 			token, _ := request.Params[1].(string)
@@ -142,6 +150,7 @@ type RpcRequest struct {
 	Method   ClashRpcType `json:"method"`
 	Params   []any        `json:"params"`
 	tunOwner *tunSession
+	ctx      context.Context
 }
 type RpcResult struct {
 	Key    int          `json:"key"`
@@ -387,7 +396,11 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		url, _ := request.Params[0].(string)
 		userAgent, _ := request.Params[1].(string)
 		filePath, _ := request.Params[2].(string)
-		data, err := handleDownloadConfig(url, userAgent, filePath)
+		ctx := request.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		data, err := handleDownloadConfigContext(ctx, url, userAgent, filePath)
 		if err != nil {
 			ret.Error = err.Error()
 		} else {
