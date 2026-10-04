@@ -339,7 +339,7 @@ export class Profile {
             throw new Error('配置导入失败: ' + (error as Error).message + '; 恢复失败: ' + (rollbackError as Error).message)
           }
         }
-        throw error
+        throw error as Error
       }
       this.lastUpdateDate = new Date().getTime();
     } finally {
