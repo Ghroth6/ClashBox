@@ -5,7 +5,6 @@ import (
 	"core/compat"
 	"core/state"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net"
