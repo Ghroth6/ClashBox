@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"core/compat"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +20,6 @@ import (
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/constant/features"
 	cp "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/hub"
 	"github.com/metacubex/mihomo/hub/route"
@@ -30,10 +30,15 @@ import (
 )
 
 var (
-	isRunning = false
-	runLock   sync.Mutex
-	b, _      = batch.New[bool](context.Background(), batch.WithConcurrencyNum[bool](50))
+	errNotExternalProvider = errors.New("not external provider")
+	isRunning              = false
+	runLock                sync.Mutex
+	b, _                   = batch.New[bool](context.Background(), batch.WithConcurrencyNum[bool](50))
 )
+
+func init() {
+	compat.ConfigureEmbeddedController()
+}
 
 type ExternalProviders []ExternalProvider
 
@@ -105,6 +110,13 @@ func toExternalProvider(p cp.Provider) (*ExternalProvider, error) {
 	switch p.(type) {
 	case *provider.ProxySetProvider:
 		psp := p.(*provider.ProxySetProvider)
+		if psp == nil {
+			return nil, errors.New("nil proxy provider")
+		}
+		info, err := compat.SubscriptionInfo(psp)
+		if err != nil {
+			return nil, err
+		}
 		return &ExternalProvider{
 			Name:             psp.Name(),
 			Type:             psp.Type().String(),
@@ -112,7 +124,7 @@ func toExternalProvider(p cp.Provider) (*ExternalProvider, error) {
 			Count:            psp.Count(),
 			UpdateAt:         psp.UpdatedAt(),
 			Path:             psp.Vehicle().Path(),
-			SubscriptionInfo: psp.GetSubscriptionInfo(),
+			SubscriptionInfo: info,
 		}, nil
 	case *rp.RuleSetProvider:
 		rsp := p.(*rp.RuleSetProvider)
@@ -125,7 +137,7 @@ func toExternalProvider(p cp.Provider) (*ExternalProvider, error) {
 			Path:        rsp.Vehicle().Path(),
 		}, nil
 	default:
-		return nil, errors.New("not external provider")
+		return nil, errNotExternalProvider
 	}
 }
 
@@ -166,6 +178,11 @@ func decorationConfig(profileId string, cfg config.RawConfig) (*config.RawConfig
 func overwriteConfig(targetConfig *config.RawConfig, _ config.RawConfig) error {
 	if !targetConfig.DNS.Enable {
 		return errors.New("VPN profile requires dns.enable: true; imported DNS was not changed")
+	}
+	for _, inbound := range targetConfig.Listeners {
+		if inbound["type"] == "tun" {
+			return errors.New("VPN profile cannot create a named TUN listener; the system VPN owns TUN")
+		}
 	}
 	// The system VPN Extension owns routes and the TUN file descriptor.
 	targetConfig.Tun.Enable = false
@@ -228,7 +245,7 @@ func updateListeners(force bool) {
 	listener.ReCreateShadowSocks(general.ShadowSocksConfig, tunnel.Tunnel)
 	listener.ReCreateVmess(general.VmessConfig, tunnel.Tunnel)
 	listener.ReCreateTuic(general.TuicServer, tunnel.Tunnel)
-	if !features.Android && !features.OHOS {
+	if !systemOwnsTUN {
 		listener.ReCreateTun(general.Tun, tunnel.Tunnel)
 	}
 }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"core/compat"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -16,7 +18,6 @@ import (
 	"github.com/metacubex/mihomo/common/observable"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/mmdb"
-	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/constant"
 	cp "github.com/metacubex/mihomo/constant/provider"
@@ -488,10 +489,14 @@ func handleGetExternalProviders() string {
 	defer runLock.Unlock()
 	externalProviders = getExternalProvidersRaw()
 	eps := make([]ExternalProvider, 0)
-	for _, p := range externalProviders {
+	for name, p := range externalProviders {
 		externalProvider, err := toExternalProvider(p)
-		if err != nil {
+		if errors.Is(err, errNotExternalProvider) {
 			continue
+		}
+		if err != nil {
+			log.Errorln("serialize provider %s: %v", name, err)
+			return "" // Preserve the existing failure sentinel, not a partial list.
 		}
 		eps = append(eps, *externalProvider)
 	}
@@ -525,26 +530,8 @@ func handleUpdateGeoData(geoType string, geoName string, fn func(value string)) 
 	go func() {
 		path := constant.Path.Resolve(geoName)
 		switch geoType {
-		case "MMDB":
-			err := updater.UpdateMMDBWithPath(path)
-			if err != nil {
-				fn(err.Error())
-				return
-			}
-		case "ASN":
-			err := updater.UpdateASNWithPath(path)
-			if err != nil {
-				fn(err.Error())
-				return
-			}
-		case "GeoIp":
-			err := updater.UpdateGeoIpWithPath(path)
-			if err != nil {
-				fn(err.Error())
-				return
-			}
-		case "GeoSite":
-			err := updater.UpdateGeoSiteWithPath(path)
+		case "MMDB", "ASN", "GeoIp", "GeoSite":
+			err := compat.UpdateGeoData(geoType, geoName)
 			if err != nil {
 				fn(err.Error())
 				return
@@ -557,6 +544,9 @@ func handleUpdateGeoData(geoType string, geoName string, fn func(value string)) 
 				fn(err.Error())
 				return
 			}
+		default:
+			fn(fmt.Sprintf("unsupported geodata type %q", geoType))
+			return
 		}
 		fn("")
 	}()

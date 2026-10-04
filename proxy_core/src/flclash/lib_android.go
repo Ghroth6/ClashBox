@@ -4,6 +4,7 @@ package main
 
 import "C"
 import (
+	"core/compat"
 	"core/platform"
 	"core/state"
 	t "core/tun"
@@ -265,6 +266,6 @@ func updateDns(s *C.char) {
 	go func() {
 		log.Infoln("[DNS] updateDns %s", dnsList)
 		dns.UpdateSystemDNS(strings.Split(dnsList, ","))
-		dns.FlushCacheWithDefaultResolver()
+		compat.FlushDNS()
 	}()
 }

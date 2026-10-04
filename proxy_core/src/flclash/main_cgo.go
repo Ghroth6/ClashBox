@@ -5,6 +5,7 @@ package main
 //#include "bridge.h"
 import "C"
 import (
+	"core/compat"
 	"core/state"
 	"encoding/json"
 	"fmt"
@@ -179,7 +180,7 @@ func updateDns(env js.Env, this js.Value, args []js.Value) any {
 	go func() {
 		log.Infoln("[DNS] updateDns %s", dnsList)
 		dns.UpdateSystemDNS(strings.Split(dnsList, ","))
-		dns.FlushCacheWithDefaultResolver()
+		compat.FlushDNS()
 		promise.Resolve(nil)
 	}()
 	return promise

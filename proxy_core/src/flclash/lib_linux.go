@@ -4,6 +4,7 @@ package main
 
 import "C"
 import (
+	"core/compat"
 	"core/platform"
 	"core/state"
 	t "core/tun"
@@ -102,7 +103,7 @@ func startKeepalive() {
 				}
 				// 仅在有活跃连接时才做健康检查, 无流量时跳过以降低功耗
 				connSnapshot := statistic.DefaultManager.Snapshot()
-				if connSnapshot != nil && connSnapshot.ConnectionCount() > 0 {
+				if compat.ConnectionCount(connSnapshot) > 0 {
 					go handleHealthCheckAll()
 				}
 				func() {
@@ -170,7 +171,7 @@ func StopTun() {
 		tunListener = nil
 	}
 	removeSocketHook()
-	dns.FlushCacheWithDefaultResolver()
+	compat.FlushDNS()
 }
 
 func SetFdMap(fd C.long) { acknowledgeProtectedSocket(int64(fd)) }
@@ -281,7 +282,7 @@ func UpdateDns(s *C.char) {
 	go func() {
 		log.Infoln("[DNS] updateDns %s", dnsList)
 		dns.UpdateSystemDNS(strings.Split(dnsList, ","))
-		dns.FlushCacheWithDefaultResolver()
+		compat.FlushDNS()
 	}()
 }
 
@@ -290,7 +291,7 @@ func UpdateSystemDns(dnsList string) error {
 	go func() {
 		log.Infoln("[DNS] updateDns %s", dnsList)
 		dns.UpdateSystemDNS(strings.Split(dnsList, ","))
-		dns.FlushCacheWithDefaultResolver()
+		compat.FlushDNS()
 	}()
 	return nil
 }
