@@ -49,6 +49,15 @@ class NativeNetworkDependencies implements NetworkSnapshotDependencies {
 
 // Native state survives a monitor stop/start. Never restart its generation at 1.
 let generation = 0;
+// NetworkKit's connection declaration excludes concurrent API calls unless
+// explicitly documented. Keep registration, reads and release serial even when
+// stop/start replaces a run while an earlier platform call is still pending.
+let networkQueue: Promise<void> = Promise.resolve();
+function serializeNetwork<T>(operation: () => Promise<T>): Promise<T> {
+  const result = networkQueue.then(operation);
+  networkQueue = result.then(() => {}, () => {});
+  return result;
+}
 function nextGeneration(): number {
   generation++;
   if (!Number.isSafeInteger(generation)) throw new Error('Network generation exhausted');
@@ -154,7 +163,7 @@ export function buildNetworkSnapshot(networkId: number, properties: connection.C
 }
 
 class NetworkRun {
-  listener: connection.NetConnection;
+  listener: connection.NetConnection | undefined;
   registered: boolean = false;
   disposed: boolean = false;
   released: boolean = false;
@@ -164,7 +173,6 @@ class NetworkRun {
   requiredWaiters: number = 0;
   starting: Promise<void> | undefined;
   worker: Promise<void> | undefined;
-  constructor(listener: connection.NetConnection) { this.listener = listener; }
 }
 
 export class PlatformNetworkMonitor {
@@ -177,9 +185,7 @@ export class PlatformNetworkMonitor {
 
   start(): Promise<void> {
     if (this.run !== undefined) return this.run.starting === undefined ? this.prepare(this.run) : this.run.starting;
-    let run: NetworkRun;
-    try { run = new NetworkRun(this.dependencies.createConnection()); }
-    catch (error) { this.publishOffline(); return Promise.reject(error); }
+    const run = new NetworkRun();
     this.run = run;
     run.starting = this.initialize(run);
     return run.starting;
@@ -212,22 +218,27 @@ export class PlatformNetworkMonitor {
 
   private async initialize(run: NetworkRun): Promise<void> {
     try {
-      await new Promise<void>((resolve, reject) => {
-        run.listener.register((error) => {
-          if (error) { reject(new Error('Network listener registration failed: ' + JSON.stringify(error))); return; }
-          run.registered = true;
-          if (run.disposed) this.release(run);
-          resolve();
+      await serializeNetwork(async () => {
+        if (!this.current(run)) throw new Error('Network monitor stopped before registration');
+        const listener = this.dependencies.createConnection();
+        run.listener = listener;
+        await new Promise<void>((resolve, reject) => {
+          listener.register((error) => {
+            if (error) { reject(new Error('Network listener registration failed: ' + JSON.stringify(error))); return; }
+            run.registered = true;
+            if (run.disposed) this.release(run);
+            resolve();
+          });
         });
+        if (!this.current(run)) throw new Error('Network monitor stopped during registration');
+        // Subscribe after register as required by the SDK's on declarations.
+        // Explicit first collection covers changes during registration.
+        listener.on('netAvailable', () => this.changed(run, false));
+        listener.on('netCapabilitiesChange', () => this.changed(run, false));
+        listener.on('netConnectionPropertiesChange', () => this.changed(run, false));
+        listener.on('netLost', () => this.changed(run, true));
+        listener.on('netUnavailable', () => this.changed(run, true));
       });
-      if (!this.current(run)) throw new Error('Network monitor stopped during registration');
-      // Subscribe after register as required by the SDK's on(...) declarations.
-      // The explicit first collection also covers changes during registration.
-      run.listener.on('netAvailable', () => this.changed(run, false));
-      run.listener.on('netCapabilitiesChange', () => this.changed(run, false));
-      run.listener.on('netConnectionPropertiesChange', () => this.changed(run, false));
-      run.listener.on('netLost', () => this.changed(run, true));
-      run.listener.on('netUnavailable', () => this.changed(run, true));
       run.revision++;
       run.pending = true;
       await this.refresh(run);
@@ -279,7 +290,10 @@ export class PlatformNetworkMonitor {
       const revision = run.revision;
       const value = nextGeneration();
       try {
-        const snapshot = await this.collect(value);
+        const snapshot = await serializeNetwork(() => {
+          if (!this.current(run)) return Promise.reject(new Error('Network monitor stopped before collection'));
+          return this.collect(value);
+        });
         if (!this.current(run)) throw new Error('Network monitor stopped during collection');
         if (revision !== run.revision) continue;
         this.publish(snapshot);
@@ -357,12 +371,18 @@ export class PlatformNetworkMonitor {
   private release(run: NetworkRun): void {
     if (run.released) return;
     run.released = true;
-    try {
-      run.listener.unregister((error) => {
-        if (error) this.dependencies.log('Network listener unregister failed: ' + JSON.stringify(error));
-      });
-    } catch (error) {
-      this.dependencies.log('Network listener unregister failed: ' + (error as Error).message);
-    }
+    const listener = run.listener;
+    if (listener === undefined) return;
+    serializeNetwork(() => new Promise<void>((resolve) => {
+      try {
+        listener.unregister((error) => {
+          if (error) this.dependencies.log('Network listener unregister failed: ' + JSON.stringify(error));
+          resolve();
+        });
+      } catch (error) {
+        this.dependencies.log('Network listener unregister failed: ' + (error as Error).message);
+        resolve();
+      }
+    })).catch((error: Error) => this.dependencies.log('Network listener release failed: ' + error.message));
   }
 }

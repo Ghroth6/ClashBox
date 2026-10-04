@@ -131,6 +131,7 @@ test('start is idempotent, waits for first accepted snapshot, then stop publishe
   assert.equal(state.publications.length, 1);
   assert.equal(state.publications[0].online, true);
   monitor.stop();
+  await until(() => state.listeners[0].unregisterCalls === 1);
   assert.equal(state.listeners[0].unregisterCalls, 1);
   assert.equal(state.publications.at(-1).online, false);
   assert.ok(state.publications.at(-1).generation > state.publications[0].generation);
@@ -220,9 +221,12 @@ test('stop and restart cannot resurrect an older pending collection', async () =
   const oldRejected = assert.rejects(oldStart, /stopped/);
   await until(() => calls === 1);
   monitor.stop();
-  await monitor.start();
-  const acceptedGeneration = state.publications.at(-1).generation;
+  const newStart = monitor.start();
+  await setImmediate();
+  assert.equal(state.listeners.length, 1, 'new platform registration must wait for the pending SDK call');
   gate.resolve(properties('obsolete0')); await oldRejected;
+  await newStart;
+  const acceptedGeneration = state.publications.at(-1).generation;
   assert.equal(state.publications.at(-1).generation, acceptedGeneration);
   assert.equal(state.publications.at(-1).interfaces[0].name, 'new0');
   state.listeners[0].emit('netLost');
@@ -239,8 +243,10 @@ test('late registration after stop is unregistered and never publishes online', 
   };
   const monitor = new PlatformNetworkMonitor(dependencies);
   const starting = monitor.start(); const rejected = assert.rejects(starting, /stopped/);
+  await until(() => callback !== undefined);
   monitor.stop();
   state.listeners[0].registered = true; callback(undefined); await rejected;
+  await until(() => state.listeners[0].unregisterCalls === 1);
   assert.equal(state.listeners[0].unregisterCalls, 1);
   assert.equal(state.publications.length, 1);
   assert.equal(state.publications[0].online, false);
@@ -257,7 +263,7 @@ test('initial registration, collection and native publication failures reject an
     const monitor = new PlatformNetworkMonitor(dependencies);
     await assert.rejects(monitor.start());
     assert.equal(state.publications.at(-1).online, false, mode);
-    if (mode === 'collect' || mode === 'publish') assert.equal(state.listeners[0].unregisterCalls, 1);
+    if (mode === 'collect' || mode === 'publish') await until(() => state.listeners[0].unregisterCalls === 1);
   }
 });
 
