@@ -1,6 +1,5 @@
 import { socket } from '@kit.NetworkKit';
 import { common } from '@kit.AbilityKit';
-import { CommonVpnService } from './CommonVpnService';
 import { FlClashVpnService } from './FlClashVpnService';
 import { startIpc } from 'libflclash.so';
 import { fileIo } from '@kit.CoreFileKit';
@@ -11,15 +10,15 @@ import { writeFile } from '../fileUtils';
 export class SocketStubService {
   server: socket.LocalSocketServer = socket.constructLocalSocketServerInstance();
   clientPool: Map<number, socket.LocalSocketConnection>
-  vpnService: CommonVpnService
+  vpnService: FlClashVpnService
   constructor( context: common.Context) {
     this.clientPool = new Map()
     this.vpnService = new FlClashVpnService(context)
-    this.vpnService.init()
   }
 
   async startService(requestId: number){
     try {
+      await this.vpnService.init()
       const socketPath = this.vpnService.context.filesDir + '/ClashBox.sock'
       const goPath = this.vpnService.context.filesDir + '/clash_go.sock'
       // 清理上次进程残留的 socket 文件(强杀/异常退出时 onDestroy 未执行)，
@@ -49,6 +48,7 @@ export class SocketStubService {
       })
       await this.lockVpn(requestId)
     } catch (e) {
+      this.vpnService.shutdown()
       console.error("socket failure", e.message)
       // 启动失败也清理残留文件, 避免下一次 startService 同样被旧文件阻塞
       try {
@@ -83,7 +83,7 @@ export class SocketStubService {
     })
     this.clientPool.clear()
     this.server.off('connect')
-    this.vpnService.stopVpn()
+    this.vpnService.shutdown()
     const socketPath = this.vpnService.context.filesDir + '/ClashBox.sock'
     const goPath = this.vpnService.context.filesDir + '/clash_go.sock'
     let lockPath = this.vpnService.context.filesDir + '/vpn_ipc.lock';

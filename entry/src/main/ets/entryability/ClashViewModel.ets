@@ -32,6 +32,16 @@ export interface DelayInfo{
     name: string
     delay: number
 }
+interface CoreEventData {
+  name?: string
+  value?: number
+  success?: boolean
+  error?: string
+}
+interface CoreEvent {
+  type: string
+  data?: CoreEventData
+}
 
 export class ClashViewModel {
   vpnRequestId = 0;
@@ -202,9 +212,10 @@ export class ClashViewModel {
   }
   async changeProxy(profile: Profile, g:string, p: string){
     try {
+      const result = await this.socketProxy.changeProxy(g, p)
+      if (result !== '') throw new Error(result)
       profile.proxySelected?.set(g, p)
       await this.profileRepo.addOrUpdate(profile)
-      await this.socketProxy.changeProxy(g, p)
       EventHub.sendEvent(EventKey.checkIpInfo)
     } catch (e) {
       ClashViewModel.promptAction.showToast({message: e.message, duration:3000})
@@ -221,6 +232,45 @@ export class ClashViewModel {
 
 
   delayMap: Map<string, DelayInfo> = new Map()
+  private coreEvents?: () => void
+  private coreEventsPending?: Promise<void>
+  private coreEventsGeneration: number = 0
+  private cancelCoreEvents(): void {
+    this.coreEventsGeneration++
+    this.coreEvents?.()
+    this.coreEvents = undefined
+    this.coreEventsPending = undefined
+  }
+  private async ensureCoreEvents(): Promise<void> {
+    if (this.coreEvents) return
+    if (this.coreEventsPending) return this.coreEventsPending
+    const generation = this.coreEventsGeneration
+    const pending = this.socketProxy.registerMessage((raw: string) => {
+      if (generation !== this.coreEventsGeneration) return
+      const event = JSON.parse(raw) as CoreEvent
+      if (event.type === 'delay' && event.data?.name !== undefined && event.data?.value !== undefined) {
+        const delay: DelayInfo = { name: event.data.name, delay: event.data.value }
+        this.delayMap.set(delay.name, delay)
+        EventHub.sendEvent(EventKey.TestDelay, delay)
+      } else if (event.type === 'loaded' || event.type === 'resync') {
+        if (event.type === 'resync') this.delayMap.clear()
+        EventHub.sendEvent(EventKey.FetchProxyGroup)
+        if (event.data?.success === false) console.error('Provider 初始化失败', event.data.name, event.data.error)
+      } else if (event.type === 'subscription-error') {
+        this.coreEvents = undefined
+        console.error('核心事件订阅中断，需要重新加载配置以恢复')
+      }
+    }).then((cancel: () => void) => {
+      if (generation !== this.coreEventsGeneration) {
+        cancel()
+        throw new Error('核心事件订阅已取消')
+      }
+      this.coreEvents = cancel
+    })
+    this.coreEventsPending = pending
+    try { await pending }
+    finally { if (this.coreEventsPending === pending) this.coreEventsPending = undefined }
+  }
 
   async testDelay(proxyName: string): Promise<number>{
     try {
@@ -327,7 +377,7 @@ export class ClashViewModel {
       const groups = list.map((g)=>{
         g.proxies = g.proxies.map((p) => {
           // p.isShowFavoriteProxy = favoriteProxys?.get(g.name + "|" + p.name) != null
-          p.latency = -1
+          p.latency = this.delayMap.get(p.name)?.delay ?? p.latency ?? -1
           p.g = g.name
           return p
         })
@@ -343,6 +393,7 @@ export class ClashViewModel {
   //BUG 第一次启动，参数传不过去
   // 第一次要权限弹窗
   async ChangeCore(coreType: ClashCore | undefined = undefined, restart: boolean = true) {
+    this.cancelCoreEvents()
     let requestId = Date.now();
     this.vpnRequestId = requestId;
     const vpnWant = {
@@ -399,6 +450,9 @@ export class ClashViewModel {
   }
 
   async loadProfileAndConfig(id: string, config: ClashConfig | null = null, params: ConfigExtendedParams | null= null){
+    const generation = this.coreEventsGeneration
+    await this.ensureCoreEvents()
+    if (generation !== this.coreEventsGeneration) throw new Error('配置加载已取消')
     let result = await this.socketProxy.loadConfig({
       "profile-id": id,
       config: config ?? new ClashConfig(),
@@ -481,6 +535,7 @@ export class ClashViewModel {
   }
 
   async StopVpn(){
+    this.cancelCoreEvents()
     this.vpnStarted = false
     this.socketProxy.stopClash()
     // Index里的停止后操作

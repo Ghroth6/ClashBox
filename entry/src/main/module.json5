@@ -86,6 +86,9 @@
         "name": "ohos.permission.INTERNET",
       },
       {
+        "name": "ohos.permission.GET_NETWORK_INFO"
+      },
+      {
         // 适人握持(动作感知)
         "name": "ohos.permission.DETECT_GESTURE"
       },

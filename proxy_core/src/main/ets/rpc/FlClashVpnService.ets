@@ -1,4 +1,5 @@
 import { requireAllowlist } from './AllowlistPolicy';
+import { PlatformNetworkMonitor } from './NetworkSnapshot';
 import { vpnExtension, socket } from '@kit.NetworkKit';
 import {
   startTun, stopTun, setFdMap, getVpnOptions, startLog, getProxies, getTraffic,
@@ -61,6 +62,7 @@ export class FlClashVpnService extends CommonVpnService {
   protectSocketPath: string = ""
   private clashSocket: socket.LocalSocket | undefined
   private textDecoder: util.TextDecoder = new util.TextDecoder()
+  private networkMonitor: PlatformNetworkMonitor = new PlatformNetworkMonitor()
 
   override async onRemoteMessageRequest(client: socket.LocalSocketConnection, message: socket.LocalSocketMessageInfo): Promise<void> {
     let request = JSON.parse(this.textDecoder.decodeToString(new Uint8Array(message.message))) as RpcRequest
@@ -163,6 +165,8 @@ export class FlClashVpnService extends CommonVpnService {
     const generation = ++this.startGeneration
     try {
       const config = this.ParseConfig()
+      await this.networkMonitor.start()
+      if (generation !== this.startGeneration) return false
       const tunFd = await super.getTunFd(config)
       if (generation !== this.startGeneration) return false
       if (tunFd <= 0) {
@@ -280,6 +284,11 @@ export class FlClashVpnService extends CommonVpnService {
     super.stopVpn()
   }
 
+  shutdown() {
+    this.stopVpn()
+    this.networkMonitor.stop()
+  }
+
   /**
    * protect 带重试：后台 Extension 进程受限时 vpnConnection.protect 可能偶发失败，
    * 失败重试可避免出站 fd 未保护导致流量回环（直连断网）
@@ -301,6 +310,7 @@ export class FlClashVpnService extends CommonVpnService {
   }
   override async init() {
     initClash(await getHome(this.context), "1.0.0")
+    await this.networkMonitor.start()
   }
 }
 

@@ -10,8 +10,9 @@ export const updateConfig: (paramsString: string) => Promise<string>;
 export const getCountryCode: (ip: string) => Promise<string>
 export const getProxies: () => string;
 export const changeProxy: (params: string) => Promise<string>;
-export const getTraffic: () => string;
-export const getTotalTraffic: () => string;
+export const getTraffic: (onlyProxy?: boolean) => string;
+export const getTotalTraffic: (onlyProxy?: boolean) => string;
+export const publishNetworkSnapshot: (snapshot: string) => string;
 export const resetTraffic: () => void;
 export const asyncTestDelay: (paramsString: string) => Promise<string>;
 export const getExternalProviders: () => string;
@@ -24,7 +25,8 @@ export const closeConnections: () => string;
 export const closeConnection: (connectionId: string) => string;
 export const getRequestList: () => string;
 export const clearRequestList: () => string;
-export const registerMessage: (callback: (message: string, value: string) => void) => void;
+export const registerMessage: (callback: (message: string, value: string) => void) => string | void;
+export const unregisterMessage: () => void;
 export const startLog: (callback: (message: string, value: string) => void) => string;
 // False means no configuration or a listener parse error; true is not a bind ACK.
 export const startListener: () => boolean
