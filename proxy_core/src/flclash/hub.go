@@ -47,10 +47,13 @@ var (
 )
 
 func handleInitClash(homeDirStr string) bool {
+	runLock.Lock()
+	defer runLock.Unlock()
 	if !isInit {
 		constant.SetHomeDir(homeDirStr)
 		isInit = true
 	}
+	startCoreEvents()
 	return isInit
 }
 
@@ -63,6 +66,7 @@ func handleStartListener() bool {
 	if isRunning {
 		return true
 	}
+	startCoreEvents()
 	isRunning = true
 	if err := updateListeners(true); err != nil {
 		isRunning = false
@@ -76,6 +80,7 @@ func handleStopListener() bool {
 	runLock.Lock()
 	defer runLock.Unlock()
 	isRunning = false
+	stopCoreEvents()
 	stopListeners()
 	return true
 }
@@ -95,6 +100,7 @@ func handleShutdown() bool {
 	runLock.Lock()
 	defer runLock.Unlock()
 	isRunning = false
+	stopCoreEvents()
 	stopListeners()
 	executor.Shutdown()
 	runtime.GC()
@@ -132,7 +138,12 @@ func handleUpdateConfig(bytes []byte) string {
 func handleGetProxies() string {
 	runLock.Lock()
 	defer runLock.Unlock()
-	data, err := json.Marshal(tunnel.ProxiesWithProviders())
+	catalog, err := compat.NewProxyCatalog(tunnel.Proxies(), tunnel.Providers())
+	if err != nil {
+		log.Errorln("Proxy snapshot: %s", err)
+		return ""
+	}
+	data, err := json.Marshal(catalog)
 	if err != nil {
 		return ""
 	}
@@ -149,24 +160,13 @@ func handleChangeProxy(data string, fn func(string string)) {
 			fn(err.Error())
 			return
 		}
-		groupName := *params.GroupName
-		proxyName := *params.ProxyName
-		proxies := tunnel.ProxiesWithProviders()
-		group, ok := proxies[groupName]
-		if !ok {
-			fn("Not found group")
+		if params.GroupName == nil || params.ProxyName == nil {
+			fn("group-name and proxy-name are required")
 			return
 		}
-		adapterProxy := group.(*adapter.Proxy)
-		selector, ok := adapterProxy.ProxyAdapter.(outboundgroup.SelectAble)
-		if !ok {
-			fn("Group is not selectable")
-			return
-		}
-		if proxyName == "" {
-			selector.ForceSet(proxyName)
-		} else {
-			err = selector.Set(proxyName)
+		catalog, err := compat.NewProxyCatalog(tunnel.Proxies(), tunnel.Providers())
+		if err == nil {
+			err = catalog.Select(*params.GroupName, *params.ProxyName)
 		}
 		if err != nil {
 			fn(err.Error())
@@ -228,14 +228,19 @@ func handleAsyncTestDelay(paramsString string, fn func(string)) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(params.Timeout))
 		defer cancel()
 
-		proxies := tunnel.ProxiesWithProviders()
-		proxy := proxies[params.ProxyName]
+		runLock.Lock()
+		catalog, lookupErr := compat.NewProxyCatalog(tunnel.Proxies(), tunnel.Providers())
+		var proxy constant.Proxy
+		if lookupErr == nil {
+			proxy, lookupErr = catalog.Lookup(params.ProxyName)
+		}
+		runLock.Unlock()
 
 		delayData := &Delay{
 			Name: params.ProxyName,
 		}
 
-		if proxy == nil {
+		if lookupErr != nil || proxy == nil {
 			delayData.Value = -1
 			data, _ := json.Marshal(delayData)
 			fn(string(data))
@@ -248,7 +253,7 @@ func handleAsyncTestDelay(paramsString string, fn func(string)) {
 		}
 
 		delay, err := proxy.URLTest(ctx, testUrl, expectedStatus)
-		if err != nil || delay == 0 {
+		if err != nil {
 			delayData.Value = -1
 			data, _ := json.Marshal(delayData)
 			fn(string(data))
@@ -281,15 +286,21 @@ func handleAsyncTestDelayBatch(paramsString string, fn func(string)) {
 		testURL = params.TestURL
 	}
 
-	proxies := tunnel.ProxiesWithProviders()
+	runLock.Lock()
+	catalog, catalogErr := compat.NewProxyCatalog(tunnel.Proxies(), tunnel.Providers())
+	runLock.Unlock()
+	if catalogErr != nil {
+		fn("[]")
+		return
+	}
 	var mu sync.Mutex
 	results := make([]Delay, 0, len(params.ProxyNames))
 	sem := make(chan struct{}, 50)
 	var wg sync.WaitGroup
 
 	for _, proxyName := range params.ProxyNames {
-		proxy := proxies[proxyName]
-		if proxy == nil {
+		proxy, lookupErr := catalog.Lookup(proxyName)
+		if lookupErr != nil || proxy == nil {
 			mu.Lock()
 			results = append(results, Delay{Name: proxyName, Value: -1})
 			mu.Unlock()
@@ -309,7 +320,7 @@ func handleAsyncTestDelayBatch(paramsString string, fn func(string)) {
 
 			d := Delay{Name: name}
 			delay, err := p.URLTest(ctx, testURL, expectedStatus)
-			if err != nil || delay == 0 {
+			if err != nil {
 				d.Value = -1
 			} else {
 				d.Value = int32(delay)
@@ -343,83 +354,94 @@ func handleHealthCheckAll() {
 		healthCheckMu.Unlock()
 	}()
 
-	// 直连模式下不需要健康检查，URLTest/Fallback 策略组不生效
-	if currentConfig != nil && string(currentConfig.General.Mode) == "direct" {
-		return
-	}
-	proxies := tunnel.ProxiesWithProviders()
-	if len(proxies) == 0 {
-		return
-	}
-
-	// URLTest/Fallback 的自动切换依赖子节点的 delay history。
-	// 后台只测策略组本身时，可能只复用当前不可用节点，无法刷新其它候选节点的延迟，
-	// 导致必须等 UI 回前台执行全量测速后才恢复。这里按每个策略组配置的 url/expectedStatus 展开子节点测速。
-	targets := make(map[string]healthCheckTarget)
-	visitedGroups := make(map[string]struct{})
-	var collectGroupTargets func(string)
-	collectGroupTargets = func(groupName string) {
-		if _, visited := visitedGroups[groupName]; visited {
-			return
+	targets := func() map[string]healthCheckTarget {
+		runLock.Lock()
+		defer runLock.Unlock()
+		// 直连模式下不需要健康检查，URLTest/Fallback 策略组不生效
+		if currentConfig != nil && string(currentConfig.General.Mode) == "direct" {
+			return nil
 		}
-		visitedGroups[groupName] = struct{}{}
-		group := proxies[groupName]
-		if group == nil {
-			return
-		}
-		raw, err := json.Marshal(group)
+		catalog, err := compat.NewProxyCatalog(tunnel.Proxies(), tunnel.Providers())
 		if err != nil {
-			return
+			log.Errorln("Health check catalog: %s", err)
+			return nil
 		}
-		var info struct {
-			All            []string `json:"all"`
-			TestURL        string   `json:"testUrl"`
-			ExpectedStatus string   `json:"expectedStatus"`
-		}
-		if err := json.Unmarshal(raw, &info); err != nil {
-			return
-		}
-		testURL := info.TestURL
-		if testURL == "" {
-			testURL = constant.DefaultTestURL
-		}
-		for _, childName := range info.All {
-			child := proxies[childName]
-			if child == nil {
-				continue
+		proxies := catalog.Items()
+
+		// URLTest/Fallback 的自动切换依赖子节点的 delay history。
+		// 后台只测策略组本身时，可能只复用当前不可用节点，无法刷新其它候选节点的延迟，
+		// 导致必须等 UI 回前台执行全量测速后才恢复。这里按每个策略组配置的 url/expectedStatus 展开子节点测速。
+		targets := make(map[string]healthCheckTarget)
+		visitedGroups := make(map[string]struct{})
+		var collectGroupTargets func(string)
+		collectGroupTargets = func(groupName string) {
+			if _, visited := visitedGroups[groupName]; visited {
+				return
 			}
-			if childAdapter, ok := child.(*adapter.Proxy); ok {
-				switch childAdapter.ProxyAdapter.(type) {
-				case *outboundgroup.URLTest, *outboundgroup.Fallback:
-					collectGroupTargets(childName)
+			visitedGroups[groupName] = struct{}{}
+			group := proxies[groupName]
+			if group == nil {
+				return
+			}
+			members, ok := group.Adapter().(outboundgroup.ProxyGroup)
+			if !ok {
+				return
+			}
+			raw, err := json.Marshal(group)
+			if err != nil {
+				return
+			}
+			var info struct {
+				All            []string `json:"all"`
+				TestURL        string   `json:"testUrl"`
+				ExpectedStatus string   `json:"expectedStatus"`
+			}
+			if err := json.Unmarshal(raw, &info); err != nil {
+				return
+			}
+			testURL := info.TestURL
+			if testURL == "" {
+				testURL = constant.DefaultTestURL
+			}
+			for _, child := range members.Proxies() {
+				childName := catalog.ID(child)
+				if childName == "" {
 					continue
 				}
-			}
-			key := groupName + "\x00" + childName + "\x00" + testURL + "\x00" + info.ExpectedStatus
-			targets[key] = healthCheckTarget{
-				name:           childName,
-				proxy:          child,
-				testURL:        testURL,
-				expectedStatus: info.ExpectedStatus,
+				if childAdapter, ok := child.(*adapter.Proxy); ok {
+					switch childAdapter.ProxyAdapter.(type) {
+					case *outboundgroup.URLTest, *outboundgroup.Fallback:
+						collectGroupTargets(childName)
+						continue
+					}
+				}
+				key := groupName + "\x00" + childName + "\x00" + testURL + "\x00" + info.ExpectedStatus
+				targets[key] = healthCheckTarget{
+					name:           childName,
+					proxy:          child,
+					testURL:        testURL,
+					expectedStatus: info.ExpectedStatus,
+				}
 			}
 		}
-	}
 
-	for name, proxy := range proxies {
-		if proxy == nil {
-			continue
+		for name, proxy := range proxies {
+			if proxy == nil {
+				continue
+			}
+			adapterProxy, ok := proxy.(*adapter.Proxy)
+			if !ok {
+				continue
+			}
+			switch adapterProxy.ProxyAdapter.(type) {
+			case *outboundgroup.URLTest, *outboundgroup.Fallback:
+				collectGroupTargets(name)
+			default:
+				continue
+			}
 		}
-		adapterProxy, ok := proxy.(*adapter.Proxy)
-		if !ok {
-			continue
-		}
-		switch adapterProxy.ProxyAdapter.(type) {
-		case *outboundgroup.URLTest, *outboundgroup.Fallback:
-			collectGroupTargets(name)
-		default:
-			continue
-		}
-	}
+		return targets
+	}()
 	if len(targets) == 0 {
 		return
 	}
@@ -662,43 +684,4 @@ func handleGetMemory(fn func(value string)) {
 	go func() {
 		fn(strconv.FormatUint(statistic.DefaultManager.Memory(), 10))
 	}()
-}
-
-var reqeustList = []statistic.Tracker{}
-
-const maxRequestList = 1000
-
-func init() {
-	adapter.UrlTestHook = func(url string, name string, delay uint16) {
-		delayData := &Delay{
-			Name: name,
-		}
-		if delay == 0 {
-			delayData.Value = -1
-		} else {
-			delayData.Value = int32(delay)
-		}
-		sendMessage(Message{
-			Type: DelayMessage,
-			Data: delayData,
-		})
-	}
-	statistic.DefaultRequestNotify = func(c statistic.Tracker) {
-		reqeustList = append(reqeustList, c)
-		if len(reqeustList) > maxRequestList {
-			// 超过上限，丢弃最旧的 1/4 记录，防止无限增长
-			drop := len(reqeustList) / 4
-			reqeustList = reqeustList[drop:]
-		}
-		sendMessage(Message{
-			Type: RequestMessage,
-			Data: c,
-		})
-	}
-	executor.DefaultProviderLoadedHook = func(providerName string) {
-		sendMessage(Message{
-			Type: LoadedMessage,
-			Data: providerName,
-		})
-	}
 }

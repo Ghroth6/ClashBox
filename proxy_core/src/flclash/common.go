@@ -12,7 +12,6 @@ import (
 	"sync"
 
 	"github.com/metacubex/mihomo/adapter"
-	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/common/batch"
 	"github.com/metacubex/mihomo/component/dialer"
@@ -250,29 +249,21 @@ func stopListeners() {
 	}
 }
 
-func patchSelectGroup() {
+func patchSelectGroup() error {
 	mapping := configParams.SelectedMap
 	if mapping == nil {
-		return
+		return nil
 	}
-	for name, proxy := range tunnel.ProxiesWithProviders() {
-		outbound, ok := proxy.(*adapter.Proxy)
-		if !ok {
-			continue
-		}
-
-		selector, ok := outbound.ProxyAdapter.(outboundgroup.SelectAble)
-		if !ok {
-			continue
-		}
-
-		selected, exist := mapping[name]
-		if !exist {
-			continue
-		}
-
-		selector.ForceSet(selected)
+	catalog, err := compat.NewProxyCatalog(tunnel.Proxies(), tunnel.Providers())
+	if err != nil {
+		return err
 	}
+	for name, selected := range mapping {
+		if err := catalog.Select(name, selected); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func applyConfig(rawConfig *config.RawConfig) error {
@@ -282,6 +273,10 @@ func applyConfig(rawConfig *config.RawConfig) error {
 	if err != nil {
 		return err // Keep the previous config; never apply a broad default on failure.
 	}
+	if !configParams.IsPatch {
+		eventIDs.Store(compat.NewEventIDs(nextConfig.Proxies, nextConfig.Providers))
+	}
+	startCoreEvents()
 	currentConfig = nextConfig
 	currentRawListeners = rawConfig.Listeners
 	if configParams.IsPatch {
@@ -291,7 +286,9 @@ func applyConfig(rawConfig *config.RawConfig) error {
 		runtime.GC()
 		// Do not let executor open proxy ingress before the app's lifecycle gate.
 		hub.ApplyConfig(compat.ConfigWithoutProxyListeners(currentConfig))
-		patchSelectGroup()
+		if err := patchSelectGroup(); err != nil {
+			return err
+		}
 	}
 	return updateListeners(false)
 }

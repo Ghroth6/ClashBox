@@ -5,18 +5,16 @@ package main
 //#include "bridge.h"
 import "C"
 import (
-	"core/compat"
 	"core/state"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"sync"
+	"unsafe"
 
 	napi "github.com/likuai2010/ohos-napi"
 	"github.com/likuai2010/ohos-napi/entry"
 	"github.com/likuai2010/ohos-napi/js"
-	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
-	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
 func initClash(env js.Env, this js.Value, args []js.Value) any {
@@ -77,10 +75,16 @@ func changeProxy(env js.Env, this js.Value, args []js.Value) any {
 
 func getTraffic(env js.Env, this js.Value, args []js.Value) any {
 	onlyProxy := true
+	if len(args) > 0 {
+		onlyProxy, _ = napi.GetValueBool(env.Env, args[0].Value)
+	}
 	return handleGetTraffic(onlyProxy)
 }
 func getTotalTraffic(env js.Env, this js.Value, args []js.Value) any {
 	onlyProxy := true
+	if len(args) > 0 {
+		onlyProxy, _ = napi.GetValueBool(env.Env, args[0].Value)
+	}
 	return handleGetTotalTraffic(onlyProxy)
 }
 func resetTraffic(env js.Env, this js.Value, args []js.Value) any {
@@ -175,15 +179,19 @@ func getMemory(env js.Env, this js.Value, args []js.Value) any {
 	return promise
 }
 func updateDns(env js.Env, this js.Value, args []js.Value) any {
-	dnsList, _ := napi.GetValueStringUtf8(env.Env, args[0].Value)
 	promise := env.NewPromise()
-	go func() {
-		log.Infoln("[DNS] updateDns %s", dnsList)
-		dns.UpdateSystemDNS(strings.Split(dnsList, ","))
-		compat.FlushDNS()
-		promise.Resolve(nil)
-	}()
+	promise.Resolve(UpdateSystemDns("").Error())
 	return promise
+}
+func publishNetworkSnapshot(env js.Env, this js.Value, args []js.Value) any {
+	if len(args) != 1 {
+		return "complete network snapshot required"
+	}
+	raw, _ := napi.GetValueStringUtf8(env.Env, args[0].Value)
+	if err := SetInterfaces(raw); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 func setState(env js.Env, this js.Value, args []js.Value) any {
 	paramsString, _ := napi.GetValueStringUtf8(env.Env, args[0].Value)
@@ -214,19 +222,41 @@ func setFdMap(env js.Env, this js.Value, args []js.Value) any {
 	return nil
 }
 
-var messageHandlers = map[string]js.TsFunc{}
+var messageHandlerMu sync.Mutex
+var messageHandler unsafe.Pointer
 
 func registerMessage(env js.Env, this js.Value, args []js.Value) any {
-	messageHandlers["messageTsfn"] = env.CreateThreadsafeFunction(args[0], "messageTsfn")
+	if len(args) == 0 {
+		return "callback required"
+	}
+	handler := C.flclash_events_create(unsafe.Pointer(env.Env), unsafe.Pointer(args[0].Value))
+	if handler == nil {
+		return "cannot register event callback"
+	}
+	messageHandlerMu.Lock()
+	if messageHandler != nil {
+		C.flclash_events_close(messageHandler)
+	}
+	messageHandler = handler
+	messageHandlerMu.Unlock()
+	return nil
+}
+func unregisterMessage(env js.Env, this js.Value, args []js.Value) any {
+	messageHandlerMu.Lock()
+	if messageHandler != nil {
+		C.flclash_events_close(messageHandler)
+		messageHandler = nil
+	}
+	messageHandlerMu.Unlock()
 	return nil
 }
 func getRequestList(env js.Env, this js.Value, args []js.Value) any {
-	json, _ := json.Marshal(reqeustList)
+	json, _ := json.Marshal(requestHistory.Snapshot())
 	return env.ValueOf(string(json))
 }
 
 func clearRequestList(env js.Env, this js.Value, args []js.Value) any {
-	reqeustList = []statistic.Tracker{}
+	requestHistory.Clear()
 	return env.ValueOf("")
 }
 func startListener(env js.Env, this js.Value, args []js.Value) any {
@@ -271,9 +301,11 @@ func init() {
 	entry.Export("startIpc", js.AsCallback(startIpc))
 
 	entry.Export("updateDns", js.AsCallback(updateDns))
+	entry.Export("publishNetworkSnapshot", js.AsCallback(publishNetworkSnapshot))
 	entry.Export("startLog", js.AsCallback(startLog))
 	entry.Export("stopLog", js.AsCallback(stopLog))
 	entry.Export("registerMessage", js.AsCallback(registerMessage))
+	entry.Export("unregisterMessage", js.AsCallback(unregisterMessage))
 	entry.Export("getRequestList", js.AsCallback(getRequestList))
 	entry.Export("clearRequestList", js.AsCallback(clearRequestList))
 
@@ -283,17 +315,18 @@ func init() {
 }
 
 func sendMessage(message Message) {
-	_, err := message.Json()
+	res, err := message.Json()
 	if err != nil {
 		return
 	}
-	runLock.Lock()
-	defer runLock.Unlock()
-	// if handler, ok := messageHandlers["messageTsfn"]; ok {
-	// 	key := handler.Env.ValueOf("")
-	// 	value := handler.Env.ValueOf(res)
-	// 	handler.Call(key, value)
-	// }
+	messages.Publish(res)
+	messageHandlerMu.Lock()
+	defer messageHandlerMu.Unlock()
+	if messageHandler != nil && C.flclash_events_send(messageHandler, C.CString(res)) != 0 {
+		C.flclash_events_close(messageHandler)
+		messageHandler = nil
+		log.Warnln("Native event subscription closed after delivery failure; re-register and refresh snapshots")
+	}
 }
 
 func main() {

@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/tunnel/statistic"
 
 	"github.com/metacubex/http"
 )
@@ -55,18 +54,38 @@ func startIpcProxy(path string) {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	buffer := make([]byte, 10240)
-
-	n, err := conn.Read(buffer)
-	if err != nil {
-		log.Println("ipc_go", err)
-		return
-	}
 	request := RpcRequest{}
-	err = json.Unmarshal(buffer[:n], &request)
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	err := json.NewDecoder(io.LimitReader(conn, 1024*1024)).Decode(&request)
 	if err != nil {
 		log.Println("ipc_go error", err)
 		return
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	if request.Method == RegisterOnMessage {
+		stream, unsubscribe := messages.Subscribe()
+		defer unsubscribe()
+		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.WriteString(conn, "{\"ready\":true}\n"); err != nil {
+			return
+		}
+		disconnected := make(chan struct{})
+		go func() { _, _ = io.Copy(io.Discard, conn); close(disconnected) }()
+		for {
+			select {
+			case message, ok := <-stream:
+				if !ok {
+					return
+				}
+				response, _ := json.Marshal(RpcResult{Key: request.Key, Method: request.Method, Result: message})
+				_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if _, err := conn.Write(append(response, '\n')); err != nil {
+					return
+				}
+			case <-disconnected:
+				return
+			}
+		}
 	}
 	var responseMu sync.Mutex
 	streamReady := false
@@ -144,7 +163,7 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 	switch request.Method {
 	case QueryTrafficNow:
 		onlyProxy := true
-		if len(request.Params) > 1 {
+		if len(request.Params) > 0 {
 			res, _ := request.Params[0].(bool)
 			onlyProxy = res
 		}
@@ -153,7 +172,7 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		fn(ret)
 	case QueryTrafficTotal:
 		onlyProxy := true
-		if len(request.Params) > 1 {
+		if len(request.Params) > 0 {
 			res, _ := request.Params[0].(bool)
 			onlyProxy = res
 		}
@@ -167,6 +186,9 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		fn(ret)
 	case QueryProxyGroup:
 		ret.Result = handleGetProxies()
+		if ret.Result == "" {
+			ret.Error = "cannot take a consistent proxy snapshot"
+		}
 		fn(ret)
 	case GetCountryCode:
 		str, _ := request.Params[0].(string)
@@ -178,7 +200,7 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		ret.Result = HandleRequestList()
 		fn(ret)
 	case ClearRequestList:
-		reqeustList = []statistic.Tracker{}
+		requestHistory.Clear()
 		fn(ret)
 	case CloseConnection:
 		str, _ := request.Params[0].(string)
@@ -307,6 +329,11 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		ret.Result = ConfigInited()
 		fn(ret)
 	case SetNetInterfaces:
+		if len(request.Params) != 1 {
+			ret.Error = "complete network snapshot required"
+			fn(ret)
+			return
+		}
 		paramsString, _ := request.Params[0].(string)
 		err := SetInterfaces(paramsString)
 		if err != nil {
@@ -332,9 +359,7 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		}
 		fn(ret)
 	case SetSystemDns:
-		paramsString, _ := request.Params[0].(string)
-		UpdateSystemDns(paramsString)
-		ret.Result = ""
+		ret.Error = UpdateSystemDns("").Error()
 		fn(ret)
 	case HealthCheckAll:
 		go handleHealthCheckAll()
@@ -492,7 +517,7 @@ func limitErrorBody(data []byte) string {
 }
 
 func HandleRequestList() string {
-	json, _ := json.Marshal(reqeustList)
+	json, _ := json.Marshal(requestHistory.Snapshot())
 	return string(json)
 }
 
