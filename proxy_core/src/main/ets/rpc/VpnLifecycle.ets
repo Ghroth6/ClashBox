@@ -19,13 +19,13 @@ export class VpnRunOwner {
 }
 
 export interface VpnLifecycleActions {
-  prepare(owner: VpnRunOwner): Promise<void>
-  create(owner: VpnRunOwner): Promise<number>
-  startNative(owner: VpnRunOwner, fd: number): Promise<void>
-  startListeners(owner: VpnRunOwner): void
-  cancelNative(owner: VpnRunOwner): string
-  closeChannel(owner: VpnRunOwner): Promise<void>
-  destroy(owner: VpnRunOwner): Promise<void>
+  prepare: (owner: VpnRunOwner) => Promise<void>
+  create: (owner: VpnRunOwner) => Promise<number>
+  startNative: (owner: VpnRunOwner, fd: number) => Promise<void>
+  startListeners: (owner: VpnRunOwner) => void
+  cancelNative: (owner: VpnRunOwner) => string
+  closeChannel: (owner: VpnRunOwner) => Promise<void>
+  destroy: (owner: VpnRunOwner) => Promise<void>
 }
 
 class VpnRunRecord {
