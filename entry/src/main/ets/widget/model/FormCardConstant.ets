@@ -15,7 +15,7 @@
 
 export const ENTRY_ABILITY = 'EntryAbility';
 
-export const BUNDLE_NAME = 'org.xbgroup.clashbox'
+export const BUNDLE_NAME = 'org.ghroth.clashbox'
 
 /** @description 卡片拉起方式 */
 export enum FormCarAction {

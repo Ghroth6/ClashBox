@@ -10,7 +10,7 @@ import { PCTabInfo } from "./PCTabInfo";
 
 
 /* 基础 */
-export const APP_LINKING: string = "https://xbstudio.top/clashbox"
+export const APP_LINKING: string = "clashbox://install-config"
 // 默认一分钟
 export const DEFAULT_TIMEOUT: number = 60 * 1000
 // borderRadius 20

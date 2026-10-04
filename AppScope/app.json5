@@ -1,7 +1,7 @@
 {
   "app": {
-    "bundleName": "org.xbgroup.clashboxLTS",
-    "vendor": "example",
+    "bundleName": "org.ghroth.clashbox",
+    "vendor": "Ghroth",
     "versionCode": 1007047,
     "versionName": "1.7.4",
     "icon": "$media:layered_image",

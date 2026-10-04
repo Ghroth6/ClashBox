@@ -69,14 +69,8 @@
                 "scheme": "file",
                 "utd": "general.text",
                 "maxFileSupported": 1
-              },
-              {
-                "scheme": "https",
-                "host": "xbstudio.top",
-                "pathStartWith": "clashbox"
               }
-            ],
-            "domainVerify": true
+            ]
           }
         ]
       }

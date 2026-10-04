@@ -398,7 +398,7 @@ export class ClashViewModel {
     this.vpnRequestId = requestId;
     const vpnWant = {
       deviceId: "",
-      bundleName: this.context?.applicationInfo.name, // release: org.xbgroup.clashbox, debug: org.xbgroup.clashboxb
+      bundleName: this.context?.applicationInfo.name, // 当前应用的实际 bundleName
       abilityName: "ClashVpnAbility",
       parameters: { "ClashCore" : coreType, requestId }
     } as Want

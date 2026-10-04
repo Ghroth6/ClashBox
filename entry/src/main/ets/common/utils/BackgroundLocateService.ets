@@ -117,7 +117,7 @@ export class BackgroundLocateService {
       // 添加需要被拉起应用的bundleName和abilityName
       wants: [
         {
-          bundleName: context.applicationInfo.name, // release: org.xbgroup.clashbox, debug: org.xbgroup.clashboxb
+          bundleName: context.applicationInfo.name, // 当前应用的实际 bundleName
           abilityName: "EntryAbility"
         }
       ],
