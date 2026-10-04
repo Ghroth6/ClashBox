@@ -1,6 +1,12 @@
 {
   "apiType": "stageMode",
   "buildOption": {
+    "nativeLib": {
+      "filter": {
+        // The app ships only the ARM64 flclash/QuickJS libraries.
+        "excludes": ["**/x86_64/**"]
+      }
+    }
   },
   "buildOptionSet": [
     {
