@@ -1,15 +1,15 @@
 package compat
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
-	"sync"
 
 	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
 )
 
-var geoUpdateMu sync.Mutex
+var geoUpdateGate = make(chan struct{}, 1)
 
 // GeoDataPath rejects arbitrary destinations before invoking an updater. The
 // upstream updater owns validation, persistence and the associated reload/cache
@@ -46,20 +46,31 @@ func GeoDataPath(kind, name string) (string, error) {
 }
 
 func UpdateGeoData(kind, name string) error {
-	geoUpdateMu.Lock()
-	defer geoUpdateMu.Unlock()
+	return UpdateGeoDataContext(context.Background(), kind, name)
+}
+
+func UpdateGeoDataContext(ctx context.Context, kind, name string) error {
+	select {
+	case geoUpdateGate <- struct{}{}:
+		defer func() { <-geoUpdateGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, err := GeoDataPath(kind, name); err != nil {
 		return err
 	}
 	switch kind {
 	case "MMDB":
-		return updater.UpdateMMDB()
+		return updater.UpdateMMDBContext(ctx)
 	case "ASN":
-		return updater.UpdateASN()
+		return updater.UpdateASNContext(ctx)
 	case "GeoIp":
-		return updater.UpdateGeoIp()
+		return updater.UpdateGeoIpContext(ctx)
 	case "GeoSite":
-		return updater.UpdateGeoSite()
+		return updater.UpdateGeoSiteContext(ctx)
 	}
 	return fmt.Errorf("unsupported geodata type %q", kind)
 }

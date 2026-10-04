@@ -21,7 +21,6 @@ import (
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/constant"
 	cp "github.com/metacubex/mihomo/constant/provider"
-	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
@@ -41,6 +40,7 @@ var (
 	logSubscriber       observable.Subscription[log.Event]
 	logStop             chan struct{}
 	currentConfig       *config.Config
+	configurationTasks  *compat.ConfigurationTasks
 	currentRawListeners []map[string]any
 	healthCheckMu       sync.Mutex
 	healthCheckRunning  bool
@@ -98,19 +98,6 @@ func handleForceGc() {
 	}()
 }
 
-func handleShutdown() bool {
-	compat.CancelForwarding()
-	runLock.Lock()
-	defer runLock.Unlock()
-	isRunning = false
-	stopCoreEvents()
-	err := stopListeners()
-	executor.Shutdown()
-	runtime.GC()
-	isInit = false
-	return err == nil
-}
-
 func handleValidateConfig(bytes []byte) string {
 	_, err := config.UnmarshalRawConfig(bytes)
 	if err != nil {
@@ -126,12 +113,11 @@ func handleUpdateConfig(bytes []byte) string {
 		return err.Error()
 	}
 
-	configParams = params.Params
 	prof, err := decorationConfig(params.ProfileId, params.Config)
 	if err != nil {
 		return err.Error()
 	}
-	err = applyConfig(prof)
+	err = applyConfig(prof, params.Params)
 	if err != nil {
 		return err.Error()
 	}
@@ -157,6 +143,10 @@ func handleChangeProxy(data string, fn func(string string)) {
 	runLock.Lock()
 	go func() {
 		defer runLock.Unlock()
+		if !configurationTasks.Active() {
+			fn("configuration is not active")
+			return
+		}
 		var params = &ChangeProxyParams{}
 		err := json.Unmarshal([]byte(data), params)
 		if err != nil {
@@ -214,7 +204,22 @@ func handleResetTraffic() {
 }
 
 func handleAsyncTestDelay(paramsString string, fn func(string)) {
+	// Capture both the owner and lookup before queueing. A request queued for an
+	// old configuration must not resolve a same-named proxy from the next one.
+	runLock.Lock()
+	ownerCtx, finish, ownerErr := configurationTasks.Acquire()
+	catalog, catalogErr := compat.NewProxyCatalog(tunnel.Proxies(), tunnel.Providers())
+	runLock.Unlock()
+	if ownerErr != nil {
+		fn("")
+		return
+	}
 	b.Go(paramsString, func() (bool, error) {
+		defer finish()
+		if ownerCtx.Err() != nil {
+			fn("")
+			return false, nil
+		}
 		var params = &TestDelayParams{}
 		err := json.Unmarshal([]byte(paramsString), params)
 		if err != nil {
@@ -228,16 +233,14 @@ func handleAsyncTestDelay(paramsString string, fn func(string)) {
 			return false, nil
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(params.Timeout))
+		ctx, cancel := context.WithTimeout(ownerCtx, time.Millisecond*time.Duration(params.Timeout))
 		defer cancel()
 
-		runLock.Lock()
-		catalog, lookupErr := compat.NewProxyCatalog(tunnel.Proxies(), tunnel.Providers())
+		lookupErr := catalogErr
 		var proxy constant.Proxy
 		if lookupErr == nil {
 			proxy, lookupErr = catalog.Lookup(params.ProxyName)
 		}
-		runLock.Unlock()
 
 		delayData := &Delay{
 			Name: params.ProxyName,
@@ -256,6 +259,10 @@ func handleAsyncTestDelay(paramsString string, fn func(string)) {
 		}
 
 		delay, err := proxy.URLTest(ctx, testUrl, expectedStatus)
+		if ownerCtx.Err() != nil {
+			fn("")
+			return false, nil
+		}
 		if err != nil {
 			delayData.Value = -1
 			data, _ := json.Marshal(delayData)
@@ -290,9 +297,15 @@ func handleAsyncTestDelayBatch(paramsString string, fn func(string)) {
 	}
 
 	runLock.Lock()
+	ownerCtx, finish, ownerErr := configurationTasks.Acquire()
 	catalog, catalogErr := compat.NewProxyCatalog(tunnel.Proxies(), tunnel.Providers())
 	runLock.Unlock()
+	if ownerErr != nil {
+		fn("[]")
+		return
+	}
 	if catalogErr != nil {
+		finish()
 		fn("[]")
 		return
 	}
@@ -318,7 +331,7 @@ func handleAsyncTestDelayBatch(paramsString string, fn func(string)) {
 				wg.Done()
 			}()
 
-			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(params.Timeout))
+			ctx, cancel := context.WithTimeout(ownerCtx, time.Millisecond*time.Duration(params.Timeout))
 			defer cancel()
 
 			d := Delay{Name: name}
@@ -337,7 +350,12 @@ func handleAsyncTestDelayBatch(paramsString string, fn func(string)) {
 
 	// 不阻塞 IPC handler，后台等待所有测试完成再回调
 	go func() {
+		defer finish()
 		wg.Wait()
+		if ownerCtx.Err() != nil {
+			fn("[]")
+			return
+		}
 		data, _ := json.Marshal(results)
 		fn(string(data))
 	}()
@@ -357,9 +375,16 @@ func handleHealthCheckAll() {
 		healthCheckMu.Unlock()
 	}()
 
+	var ownerCtx context.Context
+	var finish func()
 	targets := func() map[string]healthCheckTarget {
 		runLock.Lock()
 		defer runLock.Unlock()
+		var err error
+		ownerCtx, finish, err = configurationTasks.Acquire()
+		if err != nil {
+			return nil
+		}
 		// 直连模式下不需要健康检查，URLTest/Fallback 策略组不生效
 		if currentConfig != nil && string(currentConfig.General.Mode) == "direct" {
 			return nil
@@ -445,6 +470,9 @@ func handleHealthCheckAll() {
 		}
 		return targets
 	}()
+	if finish != nil {
+		defer finish()
+	}
 	if len(targets) == 0 {
 		return
 	}
@@ -465,7 +493,7 @@ func handleHealthCheckAll() {
 			if err != nil {
 				expectedStatus, _ = utils.NewUnsignedRanges[uint16]("")
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+			ctx, cancel := context.WithTimeout(ownerCtx, time.Second*5)
 			defer cancel()
 			_, _ = target.proxy.URLTest(ctx, target.testURL, expectedStatus)
 			log.Debugln("[HealthCheckAll] checked %s", target.name)
@@ -560,63 +588,86 @@ func handleGetExternalProvider(externalProviderName string) string {
 }
 
 func handleUpdateGeoData(geoType string, geoName string, fn func(value string)) {
+	runLock.Lock()
+	ctx, finish, err := configurationTasks.Acquire()
+	path := constant.Path.Resolve(geoName)
+	runLock.Unlock()
+	if err != nil {
+		fn(err.Error())
+		return
+	}
 	go func() {
-		path := constant.Path.Resolve(geoName)
+		defer finish()
+		var err error
 		switch geoType {
 		case "MMDB", "ASN", "GeoIp", "GeoSite":
-			err := compat.UpdateGeoData(geoType, geoName)
-			if err != nil {
-				fn(err.Error())
-				return
-			}
+			err = compat.UpdateGeoDataContext(ctx, geoType, geoName)
 		case "MRS":
 			// ★ BundleMRS 规则集: 官方地址下载最新 7z 覆盖内置版本(geox-url 无 mrs 字段, 用固定官方源)
 			const mrsUrl = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/BundleMRS.7z"
-			_, err := handleDownloadConfig(mrsUrl, "clash-verge/v2.5.1", path)
-			if err != nil {
-				fn(err.Error())
-				return
-			}
+			_, err = handleDownloadConfigContext(ctx, mrsUrl, "clash-verge/v2.5.1", path)
 		default:
-			fn(fmt.Sprintf("unsupported geodata type %q", geoType))
-			return
+			err = fmt.Errorf("unsupported geodata type %q", geoType)
 		}
-		fn("")
+		configurationRequestResult(ctx, err, fn)
 	}()
 }
 
 func handleUpdateExternalProvider(providerName string, fn func(value string)) {
+	runLock.Lock()
+	ctx, finish, err := configurationTasks.Acquire()
+	externalProvider := externalProviders[providerName]
+	runLock.Unlock()
+	if err != nil {
+		fn(err.Error())
+		return
+	}
 	go func() {
-		externalProvider, exist := externalProviders[providerName]
-		if !exist {
-			fn("external provider is not exist")
+		defer finish()
+		if externalProvider == nil {
+			fn("external provider does not exist")
 			return
 		}
-		err := externalProvider.Update()
-		if err != nil {
-			fn(err.Error())
+		if err := ctx.Err(); err != nil {
+			configurationRequestResult(ctx, err, fn)
 			return
 		}
-		fn("")
+		configurationRequestResult(ctx, externalProvider.Update(), fn)
 	}()
 }
 
 func handleSideLoadExternalProvider(providerName string, data []byte, fn func(value string)) {
+	runLock.Lock()
+	ctx, finish, err := configurationTasks.Acquire()
+	externalProvider := externalProviders[providerName]
+	runLock.Unlock()
+	if err != nil {
+		fn(err.Error())
+		return
+	}
 	go func() {
-		runLock.Lock()
-		defer runLock.Unlock()
-		externalProvider, exist := externalProviders[providerName]
-		if !exist {
-			fn("external provider is not exist")
+		defer finish()
+		if externalProvider == nil {
+			fn("external provider does not exist")
 			return
 		}
-		err := sideUpdateExternalProvider(externalProvider, data)
-		if err != nil {
-			fn(err.Error())
+		if err := ctx.Err(); err != nil {
+			configurationRequestResult(ctx, err, fn)
 			return
 		}
-		fn("")
+		configurationRequestResult(ctx, sideUpdateExternalProvider(externalProvider, data), fn)
 	}()
+}
+
+func configurationRequestResult(ctx context.Context, err error, fn func(string)) {
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		fn(err.Error())
+	} else {
+		fn("")
+	}
 }
 
 func handleStartLog(fn func(value string)) {

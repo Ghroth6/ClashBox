@@ -33,7 +33,7 @@ if ($dirty.Count -ne 0) {
 }
 $appHead = git -C $app rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read application HEAD' }
-$appInputsStatus = @(git -C $app status --porcelain=v1 --untracked-files=all -- 'scripts/test-wrapper-compat.ps1' 'proxy_core/src/flclash/compat')
+$appInputsStatus = @(git -C $app status --porcelain=v1 --untracked-files=all -- 'scripts/test-wrapper-compat.ps1' 'proxy_core/src/flclash/compat' 'proxy_core/src/flclash/configuration_lifecycle.go' 'tests/configuration-lifecycle')
 if ($LASTEXITCODE -ne 0) { throw 'Cannot check application test inputs' }
 $go = (Get-Command go -CommandType Application).Source
 $version = & $go version
@@ -49,6 +49,13 @@ $hashes = [ordered]@{}
 foreach ($file in Get-ChildItem -LiteralPath $source -File -Filter '*.go') {
   Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $stage 'compat')
   $hashes[$file.Name] = (Get-FileHash -LiteralPath (Join-Path $stage "compat/$($file.Name)") -Algorithm SHA256).Hash
+}
+New-Item -ItemType Directory -Path (Join-Path $stage 'lifecycle') | Out-Null
+$lifecycleInputs = @('proxy_core/src/flclash/configuration_lifecycle.go') + @(Get-ChildItem -LiteralPath (Join-Path $app 'tests/configuration-lifecycle') -File -Filter '*.go' | ForEach-Object { [IO.Path]::GetRelativePath($app, $_.FullName) })
+foreach ($name in $lifecycleInputs) {
+  $original = Join-Path $app $name
+  Copy-Item -LiteralPath $original -Destination (Join-Path $stage 'lifecycle')
+  $hashes[$name] = (Get-FileHash -LiteralPath $original -Algorithm SHA256).Hash
 }
 @'
 module core
@@ -69,7 +76,7 @@ $preparedHashes = [ordered]@{}
 foreach ($name in @('go.mod', 'go.sum')) {
   $preparedHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $stage $name) -Algorithm SHA256).Hash
 }
-[ordered]@{app=$appHead;app_inputs_status=$appInputsStatus;core=$head;manifest_core=$manifestCore;core_revision_override=$coreOverride;go=$version;input_sha256=$inputHashes;source_sha256=$hashes;prepared_sha256=$preparedHashes;scope='Portable adapters only; no full wrapper, OHOS build or device validation'} |
+[ordered]@{app=$appHead;app_inputs_status=$appInputsStatus;core=$head;manifest_core=$manifestCore;core_revision_override=$coreOverride;go=$version;input_sha256=$inputHashes;source_sha256=$hashes;prepared_sha256=$preparedHashes;scope='Portable adapters and actual configuration lifecycle; platform listener/event presentation stubs; no full wrapper, OHOS build or device validation'} |
   ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stage 'inputs.json') -Encoding utf8NoBOM
 $env:GOENV = 'off'
 $env:GOTOOLCHAIN = 'local'
@@ -79,14 +86,14 @@ $env:CGO_ENABLED = '0'
 $env:GOPATH = Join-Path $app 'local/cache/go-host'
 $env:GOMODCACHE = Join-Path $app 'local/cache/go-mod-cache'
 $env:GOCACHE = Join-Path $app 'local/cache/go-host-cache'
-& $go -C $stage test -mod=mod -count=1 -timeout=90s -v ./compat 2>&1 |
+& $go -C $stage test -mod=mod -count=1 -timeout=90s -v ./compat ./lifecycle 2>&1 |
   Tee-Object -FilePath (Join-Path $stage 'test.log')
 $result = $LASTEXITCODE
 $resolvedHashes = [ordered]@{}
 foreach ($name in @('go.mod', 'go.sum')) {
   $resolvedHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $stage $name) -Algorithm SHA256).Hash
 }
-[ordered]@{exit_code=$result;scope='Portable adapters only';inputs='inputs.json';log='test.log';resolved_inputs_sha256=$resolvedHashes} |
+[ordered]@{exit_code=$result;scope='Portable adapters and configuration lifecycle';inputs='inputs.json';log='test.log';resolved_inputs_sha256=$resolvedHashes} |
   ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stage 'result.json') -Encoding utf8NoBOM
 Write-Output "Evidence: $stage"
 exit $result

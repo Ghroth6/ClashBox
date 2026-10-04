@@ -8,20 +8,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"time"
 
-	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/common/batch"
-	"github.com/metacubex/mihomo/component/dialer"
-	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/constant"
 	cp "github.com/metacubex/mihomo/constant/provider"
-	"github.com/metacubex/mihomo/hub"
-	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/listener"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/log"
@@ -145,24 +139,7 @@ func toExternalProvider(p cp.Provider) (*ExternalProvider, error) {
 }
 
 func sideUpdateExternalProvider(p cp.Provider, bytes []byte) error {
-	switch p.(type) {
-	case *provider.ProxySetProvider:
-		psp := p.(*provider.ProxySetProvider)
-		_, _, err := psp.SideUpdate(bytes)
-		if err == nil {
-			return err
-		}
-		return nil
-	case rp.RuleSetProvider:
-		rsp := p.(*rp.RuleSetProvider)
-		_, _, err := rsp.SideUpdate(bytes)
-		if err == nil {
-			return err
-		}
-		return nil
-	default:
-		return errors.New("not external provider")
-	}
+	return compat.SideUpdateProvider(p, bytes)
 }
 
 func decorationConfig(profileId string, cfg config.RawConfig) (*config.RawConfig, error) {
@@ -195,37 +172,6 @@ func overwriteConfig(targetConfig *config.RawConfig, _ config.RawConfig) error {
 	targetConfig.Tun.AutoRoute = false
 	targetConfig.Tun.AutoDetectInterface = false
 	return nil
-}
-
-func patchConfig() {
-	log.Infoln("[Apply] patch")
-	general := currentConfig.General
-	controller := currentConfig.Controller
-	tls := currentConfig.TLS
-	tunnel.SetSniffing(general.Sniffing)
-	tunnel.SetFindProcessMode(general.FindProcessMode)
-	dialer.SetTcpConcurrent(general.TCPConcurrent)
-	dialer.DefaultInterface.Store(general.Interface)
-	adapter.UnifiedDelay.Store(general.UnifiedDelay)
-	tunnel.SetMode(general.Mode)
-	log.SetLevel(general.LogLevel)
-	resolver.DisableIPv6 = !general.IPv6
-
-	route.ReCreateServer(&route.Config{
-		Addr:        controller.ExternalController,
-		TLSAddr:     controller.ExternalControllerTLS,
-		UnixAddr:    controller.ExternalControllerUnix,
-		PipeAddr:    controller.ExternalControllerPipe,
-		Secret:      controller.Secret,
-		Certificate: tls.Certificate,
-		PrivateKey:  tls.PrivateKey,
-		DohServer:   controller.ExternalDohServer,
-		IsDebug:     false,
-		Cors: route.Cors{
-			AllowOrigins:        controller.Cors.AllowOrigins,
-			AllowPrivateNetwork: controller.Cors.AllowPrivateNetwork,
-		},
-	})
 }
 
 func updateListeners() (err error) {
@@ -287,39 +233,4 @@ func patchSelectGroup() error {
 		}
 	}
 	return nil
-}
-
-func applyConfig(rawConfig *config.RawConfig) error {
-	runLock.Lock()
-	defer runLock.Unlock()
-	nextConfig, err := config.ParseRawConfig(rawConfig)
-	if err != nil {
-		return err // Keep the previous config; never apply a broad default on failure.
-	}
-	if isRunning || systemTUNActiveLocked() {
-		return errors.New("stop the system VPN before replacing its configuration")
-	}
-	if err := stopListeners(); err != nil {
-		isRunning = false
-		return fmt.Errorf("stop forwarding before config replacement: %w", err)
-	}
-	isRunning = false
-	if !configParams.IsPatch {
-		eventIDs.Store(compat.NewEventIDs(nextConfig.Proxies, nextConfig.Providers))
-	}
-	startCoreEvents()
-	currentConfig = nextConfig
-	currentRawListeners = rawConfig.Listeners
-	if configParams.IsPatch {
-		patchConfig()
-	} else {
-		handleCloseConnectionsUnLock()
-		runtime.GC()
-		// Do not let executor open proxy ingress before the app's lifecycle gate.
-		hub.ApplyConfig(compat.ConfigWithoutProxyListeners(currentConfig))
-		if err := patchSelectGroup(); err != nil {
-			return err
-		}
-	}
-	return updateListeners()
 }

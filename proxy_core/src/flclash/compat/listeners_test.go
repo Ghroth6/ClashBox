@@ -2,6 +2,7 @@ package compat
 
 import (
 	"errors"
+	"math/rand"
 	"net"
 	"reflect"
 	"strconv"
@@ -61,15 +62,24 @@ type testPort struct {
 
 func reserveProxyPort(t *testing.T) testPort {
 	t.Helper()
+	var lastErr error
 	for attempt := 0; attempt < 20; attempt++ {
-		tcp, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
+		// TCP and UDP can have different Windows exclusion ranges. On a
+		// collision, sample another range instead of retrying adjacent ports.
+		addr := "127.0.0.1:0"
+		if attempt > 0 {
+			addr = net.JoinHostPort("127.0.0.1", strconv.Itoa(10000+rand.Intn(39000)))
 		}
-		addr := tcp.Addr().String()
 		udp, err := net.ListenPacket("udp", addr)
 		if err != nil {
-			tcp.Close()
+			lastErr = err
+			continue
+		}
+		addr = udp.LocalAddr().String()
+		tcp, err := net.Listen("tcp", addr)
+		if err != nil {
+			lastErr = err
+			udp.Close()
 			continue
 		}
 		_, port, _ := net.SplitHostPort(addr)
@@ -78,7 +88,7 @@ func reserveProxyPort(t *testing.T) testPort {
 		udp.Close()
 		return testPort{addr, n}
 	}
-	t.Fatal("no free TCP/UDP pair")
+	t.Fatalf("no free TCP/UDP pair: %v", lastErr)
 	return testPort{}
 }
 
