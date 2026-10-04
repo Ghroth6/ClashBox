@@ -157,7 +157,9 @@ test('stop while waiting native ready rejects that waiter and does not wait for 
   const start = f.service.startVpn();
   await until(() => f.calls.includes('native-start'));
   assert.equal((await f.service.stopVpn()).state, 'Stopped');
-  assert.equal((await start).state, 'Stopped');
+  const result = await start;
+  assert.equal(result.state, 'Stopped');
+  assert.equal(result.stage, 'start-cancelled');
   native.resolve();
   await setImmediate();
   assert.equal(f.calls.includes('listeners'), false);

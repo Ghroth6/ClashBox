@@ -143,8 +143,12 @@ export class VpnLifecycle {
       owner.stage = 'listeners-start'
       this.actions.startListeners(owner)
     } catch (error) {
-      record.startError = vpnError(error as Error)
-      record.startStage = owner.stage
+      // A cancelled SDK/IPC waiter is the consequence of Stop, not a new startup
+      // failure. Keep a pre-existing timeout/error, otherwise report cancellation.
+      if (!owner.cancelled && !record.startError) {
+        record.startError = vpnError(error as Error)
+        record.startStage = owner.stage
+      }
     } finally {
       record.workSettled = true
     }
