@@ -12,7 +12,7 @@ import { UpdateConfigParams } from '../models/ClashConfig';
 import { checkIp, queryCurrentIpInfo, flushHttpConnections } from '../Request';
 import { Fd, ParseProxyGroup, VpnOptions } from './FlClashVpnService';
 import { Address, isIpv4, isIpv6, VpnConfig } from './CommonVpnService';
-import { connection } from '@kit.NetworkKit';
+import { StreamSocket, StreamSubscription, StreamTimers } from './StreamSubscription';
 
 interface DelayInfo{
   name: string
@@ -76,23 +76,8 @@ export class SocketProxyService implements IClashManager {
     let result = await this.sendMessageRequest(ClashRpcType.downloadConfig, [url, agent, filePath])
     return result as string;
   }
-  async setNetIpMacInfo(){
-    try {
-      const table = await connection.getIpNeighTable()
-      const jsonParams = JSON.stringify(table);
-      let result = await this.sendMessageRequest(ClashRpcType.SetNetInterfaces, [jsonParams])
-      return result as string;
-    }catch (e) {
-      console.warn("setNetIpMacInfo 不支持注入网卡信息")
-    }
-    return "";
-  }
   async setSystemDns(dns: string){
-    try {
-      await this.sendMessageRequest(ClashRpcType.SetSystemDns, [dns])
-    }catch (e) {
-      console.warn("setSystemDns 不支持注入DNS")
-    }
+    throw new Error('系统 DNS 由网络监视器随完整网络快照更新，不支持单独覆盖');
   }
   async queryTrafficTotal(onlyProxy: boolean): Promise<Traffic> {
     let result = await this.sendMessageRequest(ClashRpcType.queryTrafficTotal, [onlyProxy])
@@ -136,8 +121,6 @@ export class SocketProxyService implements IClashManager {
   }
 
   async checkIpInfo(enableIpv6: boolean = true): Promise<IpInfo> {
-
-    this.setNetIpMacInfo();
 
     await flushHttpConnections();
 
@@ -390,48 +373,64 @@ export class SocketProxyService implements IClashManager {
     params: (string | number | boolean) [] = [],
     callBack: (message: string) => void
   ): Promise<() => void> {
-    return new Promise(async (resolve, reject)=>{
-      let tcp: socket.LocalSocket = socket.constructLocalSocketInstance();
-      tcp.on('message', (value: socket.LocalSocketMessageInfo) => {
-        let dd = this.textDecoder.decodeToString(new Uint8Array(value.message))
-        let list = dd.split("EOF")
-        for (let index = 0; index < list.length; index++) {
-          const element = list[index];
-          try {
-            if (element != ""){
-              let json = JSON.parse(element) as RpcResult
-              callBack(json.result as string)
-            }
-          }catch (e) {
-            console.error("log error", e.message, element)
-          }
-        }
-      })
-      tcp.on('error', (e: Error) => {
-        tcp.off('message')
-        tcp.off('error')
-        reject("失败")
-      });
-      const socketPath = this.context?.filesDir + '/clash_go.sock'
-      // 与 sendMessageRequest 保持一致：先检查 socket 文件是否存在，再带重试连接，
-      // 解决启动时 socket 文件已存在但服务端尚未 listen 的竞态问题，避免日志订阅静默失败
-      if (!await fileIo.access(socketPath)) {
-        reject("VPN服务未启动")
-        return;
-      }
-      tryConnect(tcp, socketPath, 3, 500).then(()=>{
-        tcp.send({ data: JSON.stringify({method, params}) });
-        resolve(()=>{
-          tcp.off('message')
-          tcp.off('error')
-          tcp.close()
-        })
-      }).catch((e: Error)=>{
-        console.log("socketProxy error", e.message)
-        this.notifyConnectionRefused(e)
-        reject(e)
-      });
-    })
+    if (!this.context) throw new Error('RPC context is not initialized');
+    const socketPath = this.context.filesDir + '/clash_go.sock';
+    const timers: StreamTimers = {
+      set: (callback: () => void, milliseconds: number): number => setTimeout(callback, milliseconds),
+      clear: (id: number): void => clearTimeout(id)
+    };
+    const subscription = new StreamSubscription(method === ClashRpcType.registerOnMessage,
+      (): StreamSocket => new LocalRpcStream(socketPath, method, params), callBack,
+      (message: string): void => console.warn(message), timers);
+    return subscription.start();
+  }
+}
+
+// One decoder per socket: incomplete UTF-8 and JSON cannot leak into another
+// subscription or a replacement connection after reconnect.
+class LocalRpcStream implements StreamSocket {
+  private path: string;
+  private method: number;
+  private params: (string | number | boolean)[];
+  private tcp: socket.LocalSocket | undefined;
+  private closed: boolean = false;
+
+  constructor(path: string, method: number, params: (string | number | boolean)[]) {
+    this.path = path;
+    this.method = method;
+    this.params = params;
+  }
+
+  async connect(onText: (text: string) => void, onDisconnect: (reason: string) => void): Promise<void> {
+    if (this.closed) throw new Error('RPC stream is closed');
+    const tcp = socket.constructLocalSocketInstance();
+    const decoder = new util.TextDecoder();
+    this.tcp = tcp;
+    tcp.on('message', (value: socket.LocalSocketMessageInfo) => {
+      if (this.closed) return;
+      try { onText(decoder.decodeToString(new Uint8Array(value.message), { stream: true })); }
+      catch (error) { onDisconnect('RPC UTF-8 decode failed: ' + String(error)); }
+    });
+    tcp.on('error', (error: Error) => onDisconnect(error.message ?? String(error)));
+    tcp.on('close', () => onDisconnect('socket closed'));
+    if (!await fileIo.access(this.path)) throw new Error('VPN服务未启动');
+    if (this.closed) throw new Error('RPC stream is closed');
+    await tcp.connect({ address: { address: this.path }, timeout: 1000 });
+    if (this.closed) throw new Error('RPC stream is closed');
+    await tcp.send({ data: JSON.stringify({ method: this.method, params: this.params }) });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    const tcp = this.tcp;
+    this.tcp = undefined;
+    if (tcp !== undefined) {
+      tcp.off('message');
+      tcp.off('error');
+      tcp.off('close');
+      tcp.close().catch((error: Error) => console.warn('RPC stream close failed: ' + error.message));
+    }
   }
 }
 
