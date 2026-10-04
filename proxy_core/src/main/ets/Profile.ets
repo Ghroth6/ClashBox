@@ -123,7 +123,7 @@ export class Profile {
           result = await socketProxy.downloadConfig(requestUrl, requestUa, tempYamlPath)
         } catch (e) {
           const nativeErr = e instanceof Error ? e.message : String(e)
-          throw new Error('原生订阅下载失败；系统 HTTP 路径尚未验证，未启用兜底: ' + nativeErr)
+          throw new Error('订阅下载失败: ' + nativeErr)
         }
         this.requireWriteRevision(revision, requestUrl)
         let disposition :string | undefined;
@@ -200,9 +200,9 @@ export class Profile {
     throw new Error("下载配置失败");
   }
 
-  private requireWriteRevision(revision: number, url: string = ''): void {
-    if (revision !== this.writeRevision || (url !== '' && this.url !== url)) {
-      throw new Error('配置已修改，旧订阅更新已取消')
+  private requireWriteRevision(revision: number, url: string = '', targetId: string = ''): void {
+    if (revision !== this.writeRevision || (url !== '' && this.url !== url) || (targetId !== '' && this.id !== targetId)) {
+      throw new Error('配置已修改，旧更新已取消')
     }
   }
 
@@ -281,8 +281,10 @@ export class Profile {
   }
 
   async saveByUri(uri: string, customRules: string[] = [], deleteRules: string[] = [], scriptContent: string = ""): Promise<Profile> {
-    this.writeRevision++
-    const filePath = await getProfilePath(this.context, this.id);
+    const revision = ++this.writeRevision
+    const targetId = this.id
+    const context = this.context
+    const directory = await getProfileDir(context, targetId);
     const src = await fs.open(uri, fs.OpenMode.READ_ONLY);
     let buffer: ArrayBuffer;
     try {
@@ -301,12 +303,11 @@ export class Profile {
       await fs.close(src.fd);
     }
     const files = decodeProfileImport(new Uint8Array(buffer));
-    const directory = await getProfileDir(this.context, this.id);
+    this.requireWriteRevision(revision, '', targetId)
     const staging = directory + '.import-' + generateUUID();
     const backup = directory + '.previous-' + generateUUID();
     await fs.mkdir(staging);
     let movedPrevious = false;
-    let committed = false;
     try {
       for (const item of files) {
         const target = staging + '/' + item.path;
@@ -321,17 +322,30 @@ export class Profile {
           await fs.close(file.fd);
         }
       }
-      // Swap the complete directory so a failed import cannot half-replace providers.
-      await fs.rename(directory, backup);
-      movedPrevious = true;
-      await fs.rename(staging, directory);
-      committed = true;
+      // Keep the guard, both renames and rollback in one synchronous section.
+      // No newer edit/import/delete can start between moving the old directory
+      // aside and either publishing this one or restoring the previous one.
+      this.requireWriteRevision(revision, '', targetId)
+      try {
+        fs.renameSync(directory, backup);
+        movedPrevious = true;
+        fs.renameSync(staging, directory);
+      } catch (error) {
+        if (movedPrevious) {
+          try {
+            fs.renameSync(backup, directory);
+            movedPrevious = false;
+          } catch (rollbackError) {
+            throw new Error('配置导入失败: ' + (error as Error).message + '; 恢复失败: ' + (rollbackError as Error).message)
+          }
+        }
+        throw error
+      }
+      this.lastUpdateDate = new Date().getTime();
     } finally {
-      if (!committed && movedPrevious) await fs.rename(backup, directory);
       if (await fs.access(staging)) await fs.rmdir(staging);
       // Keep a previous complete import for explicit recovery; no credentials are logged.
     }
-    this.lastUpdateDate = new Date().getTime();
     return this;
   }
 
