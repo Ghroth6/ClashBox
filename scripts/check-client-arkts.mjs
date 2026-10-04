@@ -19,6 +19,12 @@ if (typeof ts.ArkTSLinter_1_1?.runArkTSLinter !== 'function') throw new Error('S
 
 const files = [
   'proxy_core/src/main/ets/rpc/NetworkSnapshot.ets',
+  'proxy_core/src/main/ets/rpc/VpnLifecycle.ets',
+  'proxy_core/src/main/ets/rpc/VpnOperationClient.ets',
+  'proxy_core/src/main/ets/rpc/CommonVpnService.ets',
+  'proxy_core/src/main/ets/rpc/FlClashVpnService.ets',
+  'proxy_core/src/main/ets/rpc/SocketStubService.ets',
+  'proxy_core/src/main/ets/rpc/SocketProxyService.ets',
   'proxy_core/src/main/ets/ProfileImport.ets',
 ].map(file => path.join(repo, file));
 const options = {
@@ -26,6 +32,7 @@ const options = {
   module: ts.ModuleKind.ES2020,
   moduleResolution: ts.ModuleResolutionKind.NodeJs,
   strict: true,
+  experimentalDecorators: true,
   noEmit: true,
   skipLibCheck: true,
   lib: ['lib.es2021.d.ts', 'lib.dom.d.ts'],
@@ -39,7 +46,9 @@ const options = {
   etsLoaderPath: loader,
   needDoArkTsLinter: true,
 };
-const builder = ts.createIncrementalProgram({ rootNames: files, options, host: ts.createIncrementalCompilerHost(options) });
+const declarations = path.join(sdk, 'component/common.d.ts');
+if (!existsSync(declarations)) throw new Error(`SDK ArkUI declarations not found: ${declarations}`);
+const builder = ts.createIncrementalProgram({ rootNames: [...files, declarations], options, host: ts.createIncrementalCompilerHost(options) });
 const program = builder.getProgram();
 const diagnostics = [];
 function collect(phase, values) {

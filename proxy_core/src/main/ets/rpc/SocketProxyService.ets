@@ -13,6 +13,8 @@ import { checkIp, queryCurrentIpInfo, flushHttpConnections } from '../Request';
 import { Fd, ParseProxyGroup, VpnOptions } from './FlClashVpnService';
 import { Address, isIpv4, isIpv6, VpnConfig } from './CommonVpnService';
 import { StreamSocket, StreamSubscription, StreamTimers } from './StreamSubscription';
+import { VpnOperationResult } from './VpnLifecycle';
+import { decodeVpnOperationResult, requireVpnOperationState } from './VpnOperationClient';
 
 interface DelayInfo{
   name: string
@@ -32,6 +34,9 @@ interface TrafficInfo{
 export class SocketProxyService implements IClashManager {
   context?: common.Context
   active: boolean = false
+  lastVpnOperation: VpnOperationResult | undefined
+  private vpnCommandSequence: number = 0
+  private vpnClientId: string = `${Date.now()}-${Math.random()}`
   @Trace offlineTime: number[] = []
   private textDecoder: util.TextDecoder = new util.TextDecoder()
   /**
@@ -245,9 +250,17 @@ export class SocketProxyService implements IClashManager {
     return map
   }
 
+  async startVpnOperation(): Promise<VpnOperationResult> {
+    const sequence = ++this.vpnCommandSequence
+    this.lastVpnOperation = undefined
+    const raw = await this.sendMessageRequest(ClashRpcType.startClash, [this.vpnClientId, sequence])
+      .catch((error: Error) => { throw new Error(error?.message || String(error)) })
+    const result = decodeVpnOperationResult(raw)
+    if (sequence === this.vpnCommandSequence) this.lastVpnOperation = result
+    return result
+  }
   async startClash():Promise<boolean>{
-    let json = await this.sendMessageRequest(ClashRpcType.startClash, [])
-    return json as boolean
+    return requireVpnOperationState(await this.startVpnOperation(), 'Running')
   }
   // TODO 返回运行时间,卡片和ui统一使用 需要测试,
   async getRuntime(): Promise<number> {
@@ -279,14 +292,23 @@ export class SocketProxyService implements IClashManager {
       console.log("ClashVPN", `获取tunFd: ${tunFd}`)
       return tunFd;
     } catch (error) {
-      console.log("ClashVPN", `Clash启动失败 ${error.message} => ${error.stack}` )
+      const failure = error as Error
+      console.log("ClashVPN", `Clash启动失败 ${failure.message} => ${failure.stack}` )
       this.vpnConnection?.destroy()
       return -1
     }
   }
+  async stopVpnOperation(): Promise<VpnOperationResult> {
+    const sequence = ++this.vpnCommandSequence
+    this.lastVpnOperation = undefined
+    const raw = await this.sendMessageRequest(ClashRpcType.stopClash, [this.vpnClientId, sequence])
+      .catch((error: Error) => { throw new Error(error?.message || String(error)) })
+    const result = decodeVpnOperationResult(raw)
+    if (sequence === this.vpnCommandSequence) this.lastVpnOperation = result
+    return result
+  }
   async stopClash():Promise<boolean>{
-    let json = await this.sendMessageRequest(ClashRpcType.stopClash, [])
-    return json as boolean
+    return requireVpnOperationState(await this.stopVpnOperation(), 'Stopped')
   }
   async reset():Promise<boolean>{
     let json = await this.sendMessageRequest(ClashRpcType.reset, [])
@@ -303,7 +325,7 @@ export class SocketProxyService implements IClashManager {
       }
     } catch (e) {
       console.error("ParseMessage", e, messageBuffer)
-      reject("JSON解码失败: " + JSON.stringify(e))
+      reject("JSON解码失败: " + String(e))
     }
   }
   async sendMessageRequest(
@@ -332,7 +354,8 @@ export class SocketProxyService implements IClashManager {
         fullMessage += chunk;
         parseMessage(fullMessage)
       })
-      const rpcTimeout = (method === ClashRpcType.downloadConfig) ? 15000 : 10000
+      const lifecycleRequest = method === ClashRpcType.startClash || method === ClashRpcType.stopClash
+      const rpcTimeout = lifecycleRequest ? 40000 : (method === ClashRpcType.downloadConfig ? 15000 : 10000)
       timeoutId = setTimeout(()=>{
         if (timeout) {
           timeout = false
@@ -363,7 +386,8 @@ export class SocketProxyService implements IClashManager {
         client.send({ data: JSON.stringify({method, params}) });
       }).catch((e:Error)=>{
         this.active = false
-        this.notifyConnectionRefused(e)
+        // A failed stop must not trigger an automatic VPN restart.
+        if (!lifecycleRequest) this.notifyConnectionRefused(e)
         reject(e)
       });
     })

@@ -37,6 +37,7 @@ import { accessControlRdb } from '../common/datasources/AccessControlRdb';
 export default class EntryAbility extends UIAbility {
   private want?: Want
   private isChangeCore = false
+  private recoveringCore = false
   private windowMode: boolean = false
   private isFirstStart: boolean = true
   // 设备断点获取
@@ -430,7 +431,10 @@ export default class EntryAbility extends UIAbility {
         const obj = JSON.parse(indata.readString()) as object
         const proxyActionType = obj['proxyActionType'] as ProxyActionType
 
-        this.CardClashCoreEvent(proxyActionType)
+        this.CardClashCoreEvent(proxyActionType).catch((error: Error) => {
+          cardManager.pushCartProxyMode(ClashViewModel.vpnStarted, error.message)
+          hilog.error(0x0000, 'EntryAbility', `VPN 操作失败: ${error.message}`)
+        })
 
         return null
       })
@@ -475,7 +479,9 @@ export default class EntryAbility extends UIAbility {
     });
     // 监测vpn服务是否被回收，并且重新启动
     setInterval(async () => {
-      if (!ClashViewModel.socketProxy.active) {
+      if (!ClashViewModel.socketProxy.active && !this.recoveringCore && ClashViewModel.canRecoverVpn()) {
+        this.recoveringCore = true
+        try {
         ClashViewModel.socketProxy.active = true;
         ClashViewModel.socketProxy.offlineTime.push(Date.now());
         Xb_ToastUtil.showToast({
@@ -484,11 +490,16 @@ export default class EntryAbility extends UIAbility {
         // let clashCore = AppStorage.get<AppConfig>("appConfig")?.clashCore;
         if (!this.isChangeCore) {
           let result = await ClashViewModel.ChangeCore(clashCore);
-          if (result) {
+          if (result && ClashViewModel.canRecoverVpn()) {
             await ClashViewModel.ReStartVpn();
           }
         } else {
           this.isChangeCore = false
+        }
+        } catch (error) {
+          console.error('核心恢复失败', (error as Error).message)
+        } finally {
+          this.recoveringCore = false
         }
       }
     }, 1000);
@@ -514,6 +525,13 @@ export default class EntryAbility extends UIAbility {
   /** @description 卡片Clash核心触发事件 */
   private async CardClashCoreEvent(proxyActionType: ProxyActionType): Promise<void> {
     hilog.info(0x0000, 'EntryAbility', '%{public}s', 'CardClashCoreEvent');
+    // Cleanup remains available when configuration or the selected node is gone.
+    if (proxyActionType !== ProxyActionType.START) {
+      ClashViewModel.socketProxy.init(this.context)
+      await ClashViewModel.StopVpn()
+      clearTimeout(this.cardDelayTimer)
+      return
+    }
     // 初始化核心
     if (!this.clashCoreInitialized) {
       await ClashViewModel.init(this.context, this.uiContext?.getPromptAction()!)

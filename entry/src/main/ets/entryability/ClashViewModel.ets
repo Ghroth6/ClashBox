@@ -464,42 +464,93 @@ export class ClashViewModel {
     EventHub.sendEvent(EventKey.FetchProxyGroup, null)
   }
   async ReStartVpn(){
-    if(this.vpnStarted){
-      try {
-        await this.loadVpnOptions()
-        await this.socketProxy.stopClash()
-        this.vpnStarted = false
-        await this.loadConfig(false, 'ReStartVpn')
-        const started = await this.socketProxy.startClash()
-        if (!started) throw new Error('VPN 重新创建失败')
-        this.vpnStarted = true
-      } catch (e) {
-        this.vpnStarted = false
-        await this.socketProxy.stopClash()
-        throw e as Error
-      }
-    }
+    if (!this.vpnStarted && !this.vpnDesiredRunning) return
+    const intent = this.vpnIntentGeneration + 1
+    await this.StopVpn()
+    // Another explicit stop may arrive while this restart waits for cleanup.
+    if (this.vpnIntentGeneration !== intent) throw new Error('VPN 重启已取消')
+    await this.StartVpn()
   }
   vpnStarted = false
+  vpnDesiredRunning = false
+  private vpnIntentGeneration: number = 0
+  private vpnCleanupRequired: boolean = false
+  private vpnStartPending: Promise<void> | undefined
+  private vpnStopPending: Promise<void> | undefined
+
+  needsVpnStop(): boolean {
+    const state = this.socketProxy.lastVpnOperation?.state
+    return this.vpnCleanupRequired || this.vpnDesiredRunning || this.vpnStarted || state === 'CleanupFailed' || state === 'Stopping'
+  }
+
+  canRecoverVpn(): boolean {
+    return this.vpnDesiredRunning && !this.vpnCleanupRequired && !this.vpnStartPending && !this.vpnStopPending &&
+      this.socketProxy.lastVpnOperation?.state === 'Running'
+  }
+
+  private requireVpnIntent(generation: number): void {
+    if (!this.vpnDesiredRunning || this.vpnIntentGeneration !== generation) throw new Error('VPN 启动已取消')
+  }
 
   // 启动前要加载配置
   // loadConfig
   async StartVpn(){
-    this.vpnStarted = false
-    await this.loadConfig(false, 'StartVpn')
-    await this.loadVpnOptions()
-    let result = await this.socketProxy.startClash()
-    // 核心崩溃 小钥匙一直在，要重启两量变
-    if (!result){
-      result = await this.socketProxy.startClash()
+    if (this.vpnStopPending) {
+      throw new Error('VPN 清理尚未完成，请先重试停止')
     }
+    if (this.vpnStartPending) {
+      if (!this.vpnDesiredRunning) throw new Error('上一次 VPN 启动仍在收尾')
+      return this.vpnStartPending
+    }
+    if (this.vpnCleanupRequired || this.socketProxy.lastVpnOperation?.state === 'CleanupFailed') {
+      throw new Error('VPN 清理尚未完成，请先重试停止')
+    }
+    if (this.vpnStarted && this.vpnDesiredRunning) return
+    this.vpnDesiredRunning = true
+    const generation = ++this.vpnIntentGeneration
+    const pending = this.startVpnWithIntent(generation)
+    this.vpnStartPending = pending
+    try {
+      await pending
+    } catch (error) {
+      if (generation === this.vpnIntentGeneration) {
+        this.vpnDesiredRunning = false
+        const result = this.socketProxy.lastVpnOperation
+        if (result?.state === 'Stopped' && result.cleanupErrors.length === 0) this.vpnCleanupRequired = false
+      }
+      throw error as Error
+    } finally {
+      if (this.vpnStartPending === pending) this.vpnStartPending = undefined
+    }
+  }
+
+  private async startVpnWithIntent(generation: number): Promise<void> {
+    await this.loadConfig(false, 'StartVpn')
+    this.requireVpnIntent(generation)
+    await this.loadVpnOptions()
+    this.requireVpnIntent(generation)
+    this.vpnCleanupRequired = true
+    const result = await this.socketProxy.startClash()
+    this.requireVpnIntent(generation)
     if (!result) throw new Error('VPN 创建失败')
+    this.vpnCleanupRequired = false
     this.vpnStarted = true
     if (result){
       EventHub.sendEvent(EventKey.StartedClash)
       EventHub.sendEvent(EventKey.checkIpInfo)
     }
-    const runTime = await this.getRuntime()
+    let runTime: number
+    try {
+      runTime = await this.getRuntime()
+    } catch (error) {
+      // The service already acknowledged Running. Optional display data must
+      // not turn that successful operation into a false startup failure.
+      this.requireVpnIntent(generation)
+      console.warn('VPN 已启动，运行时间暂不可用', (error as Error).message)
+      cardManager.pushCartProxyMode(this.vpnStarted)
+      return
+    }
+    this.requireVpnIntent(generation)
     hilog.info(0x001, "EntryAbility", "StartVpn时间戳: " + runTime)
     // 启动前先初始化卡片显示文本
     cardManager.pushCartVpnServiceTime(PROXY_STARTED_DURATION_INIT_VALUE)
@@ -535,9 +586,25 @@ export class ClashViewModel {
   }
 
   async StopVpn(){
+    this.vpnDesiredRunning = false
+    this.vpnIntentGeneration++
+    if (this.vpnStopPending) return this.vpnStopPending
+    const pending = this.stopVpnWithResult()
+    this.vpnStopPending = pending
+    try {
+      await pending
+    } finally {
+      if (this.vpnStopPending === pending) this.vpnStopPending = undefined
+    }
+  }
+
+  private async stopVpnWithResult(): Promise<void> {
+    this.vpnCleanupRequired = true
+    const stopped = await this.socketProxy.stopClash()
+    if (!stopped) throw new Error('VPN 停止未确认')
+    this.vpnCleanupRequired = false
     this.cancelCoreEvents()
     this.vpnStarted = false
-    this.socketProxy.stopClash()
     // Index里的停止后操作
     EventHub.sendEvent(EventKey.StopedClash)
     // EntryAbility里的停止后操作

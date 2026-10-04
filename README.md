@@ -16,11 +16,15 @@ NetworkKit 从已连接的 INTERNET 非 VPN 网络取得真实接口、地址/�
 
 OHOS 启动在第一个 await 前取得原生代际令牌，IPC 携带令牌，停止后才接收的旧请求也会被拒绝。StopTun 先取消保护等待及其 IPC，再取得构造锁关闭监听和 TUN；构造期间保持系统 fd 生存边界，避免依赖阻塞在同步 NAPI 后的 ArkTS ACK。protect 通道断开仅清理所属实例，旧通道不能关闭新 TUN，也不能为新 VPN 重试或确认旧保护请求。应用停止直接调用 StopTun，避免先调用持同一锁的 stopListener。
 
-首次 TUN 预留前保留配置初始化网络活动；之后没有有效保护 owner 就拒绝新出站。DNS/controller/provider 后台任务仍未完整停止，系统 VPN destroy 尚无同步完成确认，因此停机后的后台下载也未恢复。完整 ArkTS/HAP、设备加载、实际 fd 回收及真机反复启停仍待验收。当前输入、产物与测试证据以协调仓 README、设计及检查点为准；tests/native-lifecycle 的实际函数宿主测试由协调仓 prepare-bridge-tests.py 准备，OS 构造器使用可控替身。
+Start/Stop RPC 现在返回异步操作结果，包含运行代次、状态、失败阶段和清理错误；客户端序号阻止迟到的旧命令改变新状态。平台保留系统 create/destroy、在途 protect 和保护通道的归属，等待实际结果；超时、释放失败或原生构造回滚无法确认时保留 CleanupFailed，阻止新启动。可重试的系统 destroy 和监听关闭由后续 Stop 重试；无法确认已消费 fd 的原生构造/Close 错误不能靠重复 Close 清零，当前只能保留诊断与阻断。同步 NAPI 阻塞不能由 ArkTS 超时中断。
 
-新增平台快照和事件客户端的宿主测试为 `tests/network-snapshot.test.mjs` 与 `tests/stream-subscription.test.mjs`；使用工程声明的 IDE Node 运行 `--test`。这些测试执行生产模型和状态机，不替代 SDK/ArkTS 编译与设备运行。
+UI 只在收到实际成功结果后发布启停事件；失败保留最后确认状态和待清理意图，不再自动发起第二次启动。停止可取消准备中的启动，旧回执及迟到运行时间查询不能恢复运行显示。配置重置和重启同样先等待停止结果。
 
-配置导入回归另见 `tests/profile-import.test.mjs`，覆盖普通 JSON、流式 YAML 原字节保留，以及识别出的资源包仍执行结构和路径限制。使用 IDE Node 运行 `scripts/check-client-arkts.mjs` 可检查 `NetworkSnapshot.ets` 与 `ProfileImport.ets`：它直接调用本机 SDK 的编译器和 ArkTS 1.1 检查器，分别输出诊断阶段、错误及警告；默认 SDK 位于 DevEco 标准安装目录，也可传入 `--sdk-ets-dir` 指定 SDK 的 `openharmony/ets`。该入口不依赖历史探针或其它工作副本，不生成 HAP。
+首次 TUN 预留前保留配置初始化网络活动；之后没有有效保护 owner 就拒绝新出站。系统 destroy 的异步等待已经实现，但尚未向原生提交完成回执以恢复管理联网；管理/转发连接、事件和 DNS 的分别收尾及配置任务退休仍待后续批次。完整 ArkTS/HAP、设备加载、系统 destroy 与原生 Close 的 fd 关系及真机反复启停仍待验收。当前输入、产物与测试证据以协调仓 README、设计及检查点为准；tests/native-lifecycle 的实际函数宿主测试由协调仓 prepare-bridge-tests.py 准备，OS 构造器使用可控替身。
+
+平台快照、事件、异步服务与 UI/RPC 的宿主测试位于 `tests/*.test.mjs`；使用工程声明的 IDE Node 运行 `--test`。生命周期测试执行生产状态机、服务与客户端方法，覆盖延迟、取消、失败、重复和迟到回执；系统 API 使用替身，不替代设备运行。
+
+配置导入回归另见 `tests/profile-import.test.mjs`，覆盖普通 JSON、流式 YAML 原字节保留，以及识别出的资源包仍执行结构和路径限制。使用 IDE Node 运行 `scripts/check-client-arkts.mjs` 可检查 NetworkSnapshot、ProfileImport 及六个生命周期/RPC 模块：它直接调用本机 SDK 编译器、ArkUI 声明和 ArkTS 1.1 检查器，分别输出诊断阶段、错误及警告；默认 SDK 位于 DevEco 标准安装目录，也可传入 `--sdk-ets-dir` 指定 SDK 的 `openharmony/ets`。该入口不依赖历史探针或其它工作副本，不检查全部 UI 页面，不生成 HAP。
 
 本机验证批次集中在 `local/runs/<批次名>`，可重建缓存放在 `local/cache`，并行工作副本保留在 `local/worktrees`。`test-wrapper-compat.ps1` 每次生成新的批次目录，内含测试副本、实际 app/core 提交和输入哈希的 `inputs.json`、日志与 `result.json`；详细信息保留在批次内，工程检查点只需链接结论和证据入口。缓存可以重新生成，验证记录的保留方式见协调仓的 `docs/material-layout.md`。
 

@@ -456,26 +456,27 @@ struct Home {
 
   /** @description 切换代理状态 */
   async switchProxyMode() {
-    if (this.configList.length === 0 || this.proxyGroups.totalCount() === 0) {
-      if (this.uiConfig.isVibrate) {
-        customVibrator.vibratorTriggerOfHapticClockTimer()
-      }
-      // 配置页没有数据，或者代理节点未加载
-      Xb_ToastUtil.showToast({message: $r('app.string.start_prompt')})
-      // vpn小钥匙可能卡死，关闭vpn小钥匙
-      await ClashViewModel.StopVpn()
-    } else {
-      this.proxyEnabled = !this.proxyEnabled
-      hilog.info(0xA002, this.componentName, `主页按钮点击后 代理启动按钮状态：${this.proxyEnabled}`)
-      if (this.proxyEnabled) {
-        await ClashViewModel.StartVpn()
-      } else {
-        console.log(`Home BackgroundDownService Clash已经停止`)
+    try {
+      if (this.configList.length === 0 || this.proxyGroups.totalCount() === 0) {
+        if (this.uiConfig.isVibrate) {
+          customVibrator.vibratorTriggerOfHapticClockTimer()
+        }
+        // 配置页没有数据，或者代理节点未加载
+        Xb_ToastUtil.showToast({message: $r('app.string.start_prompt')})
+        // vpn小钥匙可能卡死，关闭vpn小钥匙
         await ClashViewModel.StopVpn()
+      } else {
+        if (ClashViewModel.needsVpnStop()) {
+          await ClashViewModel.StopVpn()
+        } else {
+          await ClashViewModel.StartVpn()
+        }
+        if (this.uiConfig.isVibrate) {
+          customVibrator.vibratorTriggerOfHapticClockTimer()
+        }
       }
-      if (this.uiConfig.isVibrate) {
-        customVibrator.vibratorTriggerOfHapticClockTimer()
-      }
+      } catch (error) {
+      Xb_ToastUtil.showToast({ message: `${(error as Error).message ?? error}` })
     }
   }
 

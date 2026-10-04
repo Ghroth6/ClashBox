@@ -954,6 +954,7 @@ struct Index {
     const appFlowingState = AppStorage.get<AppFlowingState>("appFlowingState") ?? new AppFlowingState()
     // 启动Clash后
     EventHub.on(EventKey.StartedClash, () => {
+      this.proxyEnabled = true
       const job = async () => {
         const onlyProxy = AppStorage.get<ClashConfig>("clashConfig")?.['only-proxy'] as boolean ?? true
         hilog.info(0xFF00, "EntryAbilityTestTag", 'onlyProxy: %{public}s', onlyProxy)
@@ -1026,6 +1027,7 @@ struct Index {
     })
     // 停止Clash后
     EventHub.on(EventKey.StopedClash, () => {
+      this.proxyEnabled = false
       // 停止模拟下载
       if (this.uiConfig.backgroundDownModel) {
         console.log(`BackgroundDownService 即将执行模拟下载停止`)

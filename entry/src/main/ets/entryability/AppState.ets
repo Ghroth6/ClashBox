@@ -216,7 +216,7 @@ export class AppState {
   }
   // 清理数据 还原默认值
   static async ResetConfig(context: Context) {
-    ClashViewModel.StopVpn()
+    await ClashViewModel.StopVpn()
     AppState.ResetClashConfig()
     AppStorage.set("appConfig", new AppConfig())
     AppStorage.set("favoriteProfiles", new Map<string, string>([]))
