@@ -48,11 +48,17 @@ func startIpcProxy(path string) {
 			log.Println("ipc_go Accept err:", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConnectionAtGeneration(conn, tunSessions.Generation())
 	}
 }
 func handleConnection(conn net.Conn) {
+	handleConnectionAtGeneration(conn, tunSessions.Generation())
+}
+
+func handleConnectionAtGeneration(conn net.Conn, generation uint64) {
 	defer conn.Close()
+	// Capture before decoding: a request already being received when StopTun
+	// runs must not acquire a fresh generation after a delayed read/dispatch.
 
 	request := RpcRequest{}
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -87,6 +93,31 @@ func handleConnection(conn net.Conn) {
 			}
 		}
 	}
+	var disconnected chan struct{}
+	if request.Method == StartClash {
+		if len(request.Params) == 2 {
+			token, _ := request.Params[1].(string)
+			request.tunOwner = tunSessions.SessionForToken(token, generation)
+		}
+	}
+	if request.tunOwner != nil {
+		owner := request.tunOwner
+		defer StopTunOwner(owner)
+		disconnected = make(chan struct{})
+		// Observe peer closure during construction too, not only after tun-ready.
+		go func() {
+			_, _ = io.Copy(io.Discard, conn)
+			StopTunOwner(owner)
+			close(disconnected)
+		}()
+		go func() {
+			select {
+			case <-owner.done:
+				_ = conn.Close()
+			case <-disconnected:
+			}
+		}()
+	}
 	var responseMu sync.Mutex
 	streamReady := false
 	handleRemoteRequest(request, func(rr RpcResult) {
@@ -96,18 +127,26 @@ func handleConnection(conn net.Conn) {
 			streamReady = true
 		}
 		res, _ := json.Marshal(rr)
-		conn.Write([]byte(string(res) + "EOF"))
+		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.Write(append(res, []byte("EOF")...)); err != nil {
+			tunSessions.Cancel(request.tunOwner)
+			_ = conn.Close()
+		}
 	})
 	// Keep the protect response stream alive until the ArkTS owner closes it.
-	if request.Method == StartClash && streamReady {
-		_, _ = io.Copy(io.Discard, conn)
+	responseMu.Lock()
+	ready := streamReady
+	responseMu.Unlock()
+	if request.Method == StartClash && ready && disconnected != nil {
+		<-disconnected
 	}
 }
 
 type RpcRequest struct {
-	Key    int          `json:"key"`
-	Method ClashRpcType `json:"method"`
-	Params []any        `json:"params"`
+	Key      int          `json:"key"`
+	Method   ClashRpcType `json:"method"`
+	Params   []any        `json:"params"`
+	tunOwner *tunSession
 }
 type RpcResult struct {
 	Key    int          `json:"key"`
@@ -291,13 +330,13 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		handleStopLog()
 		fn(ret)
 	case StartClash:
-		if len(request.Params) != 1 {
-			ret.Error = "startClash requires a TUN descriptor"
+		if len(request.Params) != 2 {
+			ret.Error = "startClash requires a TUN descriptor and native start token"
 			fn(ret)
 			return
 		}
 		tunFd := anyToInt(request.Params[0])
-		err := StartTUN(tunFd, func(fd Fd) {
+		err := StartTUN(tunFd, request.tunOwner, func(fd Fd) {
 			res, _ := json.Marshal(fd)
 			fn(RpcResult{Key: request.Key, Method: request.Method, Result: string(res)})
 		})
@@ -315,7 +354,7 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		fn(ret)
 	case SetOptionState:
 		paramsString, _ := request.Params[0].(string)
-		err := json.Unmarshal([]byte(paramsString), state.CurrentState)
+		err := updateOptionState(paramsString)
 		if err != nil {
 			ret.Error = err.Error()
 		} else {
@@ -383,6 +422,12 @@ func handleRemoteRequest(request RpcRequest, fn func(RpcResult)) {
 		fn(ret)
 	}
 
+}
+
+func updateOptionState(raw string) error {
+	runLock.Lock()
+	defer runLock.Unlock()
+	return json.Unmarshal([]byte(raw), state.CurrentState)
 }
 
 func handleDownloadConfig(url string, userAgent string, filePath string) (string, error) {

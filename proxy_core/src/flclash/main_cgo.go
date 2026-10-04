@@ -5,7 +5,6 @@ package main
 //#include "bridge.h"
 import "C"
 import (
-	"core/state"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -25,11 +24,13 @@ func initClash(env js.Env, this js.Value, args []js.Value) any {
 func startTun(env js.Env, this js.Value, args []js.Value) any {
 	tunFd, _ := napi.GetValueInt32(env.Env, args[0].Value)
 	tsfn := env.CreateThreadsafeFunction(args[1], "startTun")
-	err := StartTUN(int(tunFd), func(fd Fd) {
+	owner := tunSessions.NewSession(tunSessions.Generation())
+	err := StartTUN(int(tunFd), owner, func(fd Fd) {
 
 		tsfn.Call(env.ValueOf(fd.Id), env.ValueOf(fd.Value))
 	})
 	if err != nil {
+		tunSessions.Cancel(owner)
 		return err.Error()
 	}
 	return ""
@@ -37,6 +38,10 @@ func startTun(env js.Env, this js.Value, args []js.Value) any {
 func stopTun(env js.Env, this js.Value, args []js.Value) any {
 	StopTun()
 	return nil
+}
+
+func getTunStartToken(env js.Env, this js.Value, args []js.Value) any {
+	return tunSessions.StartToken()
 }
 
 func validateConfig(env js.Env, this js.Value, args []js.Value) any {
@@ -195,7 +200,7 @@ func publishNetworkSnapshot(env js.Env, this js.Value, args []js.Value) any {
 }
 func setState(env js.Env, this js.Value, args []js.Value) any {
 	paramsString, _ := napi.GetValueStringUtf8(env.Env, args[0].Value)
-	err := json.Unmarshal([]byte(paramsString), state.CurrentState)
+	err := updateOptionState(paramsString)
 	if err != nil {
 		return nil
 	}
@@ -210,10 +215,7 @@ func getVpnOptions(env js.Env, this js.Value, args []js.Value) any {
 	return GetVpnOptions()
 }
 func getCurrentProfileName(env js.Env, this js.Value, args []js.Value) any {
-	if state.CurrentState == nil {
-		return ""
-	}
-	return state.CurrentState.CurrentProfileName
+	return GetCurrentProfileName()
 }
 
 func setFdMap(env js.Env, this js.Value, args []js.Value) any {
@@ -277,6 +279,7 @@ func init() {
 	entry.Export("startTun", js.AsCallback(startTun))
 	entry.Export("setFdMap", js.AsCallback(setFdMap))
 	entry.Export("stopTun", js.AsCallback(stopTun))
+	entry.Export("getTunStartToken", js.AsCallback(getTunStartToken))
 	entry.Export("forceGc", js.AsCallback(forceGc))
 	entry.Export("validateConfig", js.AsCallback(validateConfig))
 	entry.Export("updateConfig", js.AsCallback(updateConfig))

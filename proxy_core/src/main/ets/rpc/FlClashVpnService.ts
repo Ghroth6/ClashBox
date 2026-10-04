@@ -2,7 +2,7 @@ import { requireAllowlist } from './AllowlistPolicy';
 import { PlatformNetworkMonitor } from './NetworkSnapshot';
 import { vpnExtension, socket } from '@kit.NetworkKit';
 import {
-  startTun, stopTun, setFdMap, getVpnOptions, startLog, getProxies, getTraffic,
+  startTun, stopTun, getTunStartToken, setFdMap, getVpnOptions, startLog, getProxies, getTraffic,
   getTotalTraffic,
   getExternalProviders,
   asyncTestDelay,
@@ -21,8 +21,7 @@ import {
   registerMessage,
   getRequestList,
   clearRequestList,
-  startListener,
-  stopListener
+  startListener
 } from 'libflclash.so';
 import { Address, AddressWithPrefix, CommonVpnService, cidrToRoute, VpnConfig } from './CommonVpnService';
 import { JSON, util } from '@kit.ArkTS';
@@ -164,6 +163,7 @@ export class FlClashVpnService extends CommonVpnService {
     this.isStopped = false
     const generation = ++this.startGeneration
     try {
+      const nativeToken = getTunStartToken()
       const config = this.ParseConfig()
       await this.networkMonitor.start()
       if (generation !== this.startGeneration) return false
@@ -172,7 +172,7 @@ export class FlClashVpnService extends CommonVpnService {
       if (tunFd <= 0) {
         throw new Error('系统未返回有效的 TUN 文件描述符')
       }
-      await this.startClash(tunFd)
+      await this.startClash(tunFd, nativeToken)
       if (generation !== this.startGeneration) return false
       // The protect channel and native TUN must be ready before proxy ingress.
       // The core returns actual bind failures and rolls back partial ingress.
@@ -189,15 +189,18 @@ export class FlClashVpnService extends CommonVpnService {
     }
   }
 
-  async startClash(tunFd: number): Promise<void> {
-    this.clashSocket?.off('message')
-    this.clashSocket?.close()
+  async startClash(tunFd: number, nativeToken: string): Promise<void> {
+    const previousSocket = this.clashSocket
+    this.clashSocket = undefined
+    previousSocket?.off('message')
+    previousSocket?.close()
     let tcp: socket.LocalSocket = socket.constructLocalSocketInstance();
     this.clashSocket = tcp
     const socketPath = this.context?.filesDir + '/clash_go.sock'
     await new Promise<void>((resolve, reject) => {
       let pending = ''
       let settled = false
+      let nativeReady = false
       const timer = setTimeout(() => {
         if (!settled) {
           settled = true
@@ -211,6 +214,13 @@ export class FlClashVpnService extends CommonVpnService {
           reject(error)
         }
       }
+      const disconnected = (error: Error) => {
+        if (this.clashSocket !== tcp) return
+        fail(error)
+        if (nativeReady) this.stopVpn()
+      }
+      tcp.on('close', () => disconnected(new Error('原生 TUN 保护通道已关闭')))
+      tcp.on('error', (error: Error) => disconnected(error))
       tcp.on('message', (value: socket.LocalSocketMessageInfo) => {
         pending += this.textDecoder.decodeToString(new Uint8Array(value.message))
         if (pending.length > 65536) {
@@ -229,11 +239,12 @@ export class FlClashVpnService extends CommonVpnService {
               } else if (result.result === 'tun-ready') {
                 if (!settled) {
                   settled = true
+                  nativeReady = true
                   clearTimeout(timer)
                   resolve()
                 }
               } else {
-                this.handleProtectMessage(element)
+                this.handleProtectMessage(element, tcp)
               }
             } catch (error) {
               fail(error as Error)
@@ -247,22 +258,23 @@ export class FlClashVpnService extends CommonVpnService {
           fail(new Error('原生 TUN 启动已取消'))
           return
         }
-        await tcp.send({ data: JSON.stringify({ method: ClashRpcType.startClash, params: [tunFd] }) })
+        await tcp.send({ data: JSON.stringify({ method: ClashRpcType.startClash, params: [tunFd, nativeToken] }) })
       }).catch((error: Error) => fail(error))
     })
   }
 
   /**
    * 单个 protect 消息的异步处理：解析 fd → protect（带重试）→ setFdMap。
-   * 每个 fd 独立执行，互不阻塞。protect 失败会导致该出站 fd 未绕过 TUN → 流量回环 → 直连断网。
+   * 每个 fd 独立执行。失败或通道更换不发送 ACK，由原生端拒绝未受保护的出站连接。
    */
-  private handleProtectMessage(element: string): void {
+  private handleProtectMessage(element: string, owner: socket.LocalSocket): void {
+    if (this.clashSocket !== owner) return
     if (element == "") return
     try {
       let json = JSON.parse(element) as RpcResult
       let fd = JSON.parse(json.result as string) as Fd
-      this.protectWithRetry(fd.value, 3).then(() => {
-        setFdMap(fd.id)
+      this.protectWithRetry(fd.value, 3, owner).then(() => {
+        if (this.clashSocket === owner) setFdMap(fd.id)
       }).catch((protectErr: Error) => {
         // 重试仍失败：打 hilog 点便于确认后台 protect 是否被系统中断（hilog | grep ClashVPN protect）
         console.error("ClashVPN protect failed after retry, skipping setFdMap for fd.id=" + fd.id, protectErr.message, element)
@@ -276,11 +288,13 @@ export class FlClashVpnService extends CommonVpnService {
     this.startGeneration++
     if (this.isStopped) return
     this.isStopped = true
-    stopListener()
+    // Native Stop first cancels pending protect requests, then closes ingress
+    // and TUN. Calling stopListener here first could block behind its constructor.
     stopTun()
-    this.clashSocket?.off('message')
-    this.clashSocket?.close()
+    const previousSocket = this.clashSocket
     this.clashSocket = undefined
+    previousSocket?.off('message')
+    previousSocket?.close()
     super.stopVpn()
   }
 
@@ -293,9 +307,10 @@ export class FlClashVpnService extends CommonVpnService {
    * protect 带重试：后台 Extension 进程受限时 vpnConnection.protect 可能偶发失败，
    * 失败重试可避免出站 fd 未保护导致流量回环（直连断网）
    */
-  private async protectWithRetry(fd: number, retries: number): Promise<void> {
+  private async protectWithRetry(fd: number, retries: number, owner: socket.LocalSocket): Promise<void> {
     let lastErr: Error | undefined = undefined
     for (let i = 0; i < retries; i++) {
+      if (this.clashSocket !== owner) throw new Error('原生 TUN 保护请求已取消')
       try {
         await this.protect(fd)
         return

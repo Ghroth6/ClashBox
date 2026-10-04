@@ -4,6 +4,7 @@ export const startTun: (fd: number, callback: (id: number, fd: number) => void) 
 export const getVpnOptions: () => string;
 export const setFdMap: (fd: number) => void;
 export const stopTun: () => void;
+export const getTunStartToken: () => string;
 export const forceGc: () => void;
 export const validateConfig: (paramsString: string) => Promise<string>;
 export const updateConfig: (paramsString: string) => Promise<string>;

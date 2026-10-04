@@ -27,8 +27,28 @@ func acknowledgeProtectedSocket(id int64) {
 }
 
 func protectOutboundSocket(conn syscall.RawConn, request func(Fd), timeout time.Duration) error {
+	return protectOutboundSocketUntil(conn, request, timeout, nil)
+}
+
+var errProtectionUnavailable = errors.New("socket protection owner is unavailable; outbound connection rejected")
+
+func protectOutboundSocketUntil(conn syscall.RawConn, request func(Fd), timeout time.Duration, cancelled <-chan struct{}) error {
+	if request == nil {
+		return errProtectionUnavailable
+	}
+	select {
+	case <-cancelled:
+		return errProtectionUnavailable
+	default:
+	}
 	var protectErr error
 	err := conn.Control(func(fd uintptr) {
+		select {
+		case <-cancelled:
+			protectErr = errProtectionUnavailable
+			return
+		default:
+		}
 		id := atomic.AddInt64(&protectionSequence, 1)
 		done := make(chan struct{}, 1)
 		protectionRequests.Store(id, done)
@@ -38,8 +58,16 @@ func protectOutboundSocket(conn syscall.RawConn, request func(Fd), timeout time.
 		defer timer.Stop()
 		select {
 		case <-done:
+		case <-cancelled:
+			protectErr = errProtectionUnavailable
 		case <-timer.C:
 			protectErr = errors.New("socket protection was not acknowledged; outbound connection rejected")
+		}
+		// Cancellation wins over an ACK that was already queued by the old owner.
+		select {
+		case <-cancelled:
+			protectErr = errProtectionUnavailable
+		default:
 		}
 	})
 	if err != nil {

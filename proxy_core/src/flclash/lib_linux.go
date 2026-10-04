@@ -33,12 +33,14 @@ type ProcessMap struct {
 }
 
 var (
-	tunListener   *sing_tun.Listener
-	counter       int64 = 0
-	processMap    ProcessMap
-	runTime       *time.Time
-	errBlocked    = errors.New("blocked")
-	keepaliveStop chan struct{}
+	tunListener     *sing_tun.Listener
+	tunOwner        *tunSession // protected by runLock, including a pending constructor
+	protectionOwner atomic.Pointer[tunSession]
+	counter         int64 = 0
+	processMap      ProcessMap
+	runTime         *time.Time
+	errBlocked      = errors.New("blocked")
+	keepaliveStop   chan struct{}
 )
 
 func (cm *ProcessMap) Store(key int64, value string) {
@@ -53,23 +55,45 @@ func (cm *ProcessMap) Load(key int64) (string, bool) {
 	return value.(string), true
 }
 
-func StartTUN(fd int, markSocket func(Fd)) error {
-	runLock.Lock()
-	defer runLock.Unlock()
+func StartTUN(fd int, owner *tunSession, markSocket func(Fd)) error {
 	if fd <= 0 {
 		return errors.New("invalid system TUN descriptor")
 	}
+	// Keep construction serialized with Stop so the caller cannot destroy and
+	// recycle its system fd while the constructor still uses it. Stop cancels
+	// protect before acquiring this lock, so construction cannot await an ArkTS
+	// ACK blocked behind synchronous NAPI Stop.
+	runLock.Lock()
+	defer runLock.Unlock()
 	if currentConfig == nil {
 		return errors.New("configuration is not loaded")
 	}
-	if tunListener != nil {
-		return errors.New("TUN is already running")
+	if tunOwner != nil || !tunSessions.Reserve(owner, markSocket) {
+		return errors.New("TUN start was cancelled or a TUN is already running")
 	}
-	initSocketHook(markSocket)
-	listener, err := t.Start(fd, currentConfig.General.Tun.Device, currentConfig.General.Tun.Stack, currentConfig.General.Tun.DNSHijack)
+	tunOwner = owner
+	protectionOwner.Store(owner)
+	options := currentConfig.General.Tun
+	options.DNSHijack = append([]string(nil), options.DNSHijack...)
+	listener, err := t.Start(fd, options.Device, options.Stack, options.DNSHijack)
 	if err != nil {
-		removeSocketHook()
+		if tunOwner == owner {
+			tunOwner = nil
+		}
+		tunSessions.Cancel(owner)
+		protectionOwner.CompareAndSwap(owner, nil)
 		return err
+	}
+	if tunOwner != owner || !tunSessions.Commit(owner) {
+		if tunOwner == owner {
+			tunOwner = nil
+		}
+		tunSessions.Cancel(owner)
+		protectionOwner.CompareAndSwap(owner, nil)
+		// Only close a listener returned by a successful constructor. Ownership
+		// of a raw descriptor rejected before construction stays with the caller.
+		_ = listener.Close()
+		return errors.New("TUN start was cancelled")
 	}
 	tunListener = listener
 	now := time.Now()
@@ -154,8 +178,29 @@ func ConfigInited() string {
 }
 
 func StopTun() {
+	// Invalidate requests captured before Stop, even when their handler has not
+	// reached StartTUN yet. This also releases pending protect waits immediately.
+	tunSessions.CancelAll()
 	runLock.Lock()
 	defer runLock.Unlock()
+	tunSessions.Cancel(tunOwner)
+	stopTunLocked()
+}
+
+func StopTunOwner(owner *tunSession) {
+	// A disconnected old stream must never shut down a replacement session.
+	tunSessions.Cancel(owner)
+	runLock.Lock()
+	defer runLock.Unlock()
+	if tunOwner != owner || owner == nil {
+		return
+	}
+	stopTunLocked()
+}
+
+func stopTunLocked() {
+	protectionOwner.CompareAndSwap(tunOwner, nil)
+	tunOwner = nil
 	stopKeepalive()
 	stopCoreEvents()
 	isRunning = false
@@ -166,27 +211,32 @@ func StopTun() {
 		_ = tunListener.Close()
 		tunListener = nil
 	}
-	removeSocketHook()
 	compat.FlushDNS()
 }
 
 func SetFdMap(fd C.long) { acknowledgeProtectedSocket(int64(fd)) }
 
-func initSocketHook(markSocket func(Fd)) {
+func initSocketHook() {
 	dialer.DefaultSocketHook = func(network, address string, conn syscall.RawConn) error {
 		if platform.ShouldBlockConnection() {
 			return errBlocked
 		}
+		owner := protectionOwner.Load()
+		if owner == nil && !tunSessions.ProtectionRequired() {
+			return nil
+		}
+		if !owner.Valid() {
+			return errProtectionUnavailable
+		}
 		// DIRECT traffic also needs protection from being recaptured by this TUN.
-		return protectOutboundSocket(conn, markSocket, 5*time.Second)
+		return protectOutboundSocketUntil(conn, owner.request, 5*time.Second, owner.done)
 	}
 }
 
-func removeSocketHook() {
-	dialer.DefaultSocketHook = nil
-}
-
 func init() {
+	// The function pointer is immutable after package initialization; sessions
+	// change through an atomic owner pointer. After bootstrap, no owner is blocked.
+	initSocketHook()
 	process.DefaultPackageNameResolver = func(metadata *constant.Metadata) (string, error) {
 		if metadata == nil {
 			return "", process.ErrInvalidNetwork
@@ -231,6 +281,8 @@ func SetProcessMap(s string) string {
 }
 
 func GetCurrentProfileName() string {
+	runLock.Lock()
+	defer runLock.Unlock()
 	if state.CurrentState == nil {
 		return ""
 	}
@@ -267,10 +319,7 @@ func GetVpnOptions() string {
 
 func SetState(s *C.char) {
 	paramsString := C.GoString(s)
-	err := json.Unmarshal([]byte(paramsString), state.CurrentState)
-	if err != nil {
-		return
-	}
+	_ = updateOptionState(paramsString)
 }
 
 // Legacy DNS-only callers receive an explicit error; network publication is atomic.
