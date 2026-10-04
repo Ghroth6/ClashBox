@@ -230,6 +230,10 @@ func TestProxyCatalogRefreshRejectsStaleSelectionAndSnapshot(t *testing.T) {
 	static, providers := map[string]C.Proxy{"choice": group}, map[string]P.ProxyProvider{"refresh": p}
 	stale := requireCatalog(t, static, providers)
 	saved := stale.ID(oldProxy)
+	events := NewEventIDs(static, providers)
+	if events.ID(oldProxy, oldProxy.Name(), "refresh") != saved {
+		t.Fatal("current provider event did not match catalog identity")
+	}
 	if err = os.WriteFile(path, []byte("new"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -243,6 +247,12 @@ func TestProxyCatalogRefreshRejectsStaleSelectionAndSnapshot(t *testing.T) {
 		t.Fatal("stale catalog serialized an unknown refreshed group member")
 	}
 	current := requireCatalog(t, static, providers)
+	if events.ID(oldProxy, oldProxy.Name(), "refresh") != "" {
+		t.Fatal("replaced provider object can still publish a late event")
+	}
+	if got := events.ID(newProxy, newProxy.Name(), "refresh"); got != current.ID(newProxy) {
+		t.Fatalf("new current provider object lost its event identity: %q", got)
+	}
 	if _, err = current.Lookup(saved); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("removed qualified node did not fail lookup: %v", err)
 	}
@@ -296,21 +306,34 @@ func TestEventIDsMatchCatalogForStaticSharedAndProviderNodes(t *testing.T) {
 	static := map[string]C.Proxy{"shared": shared, collision: catalogProxy(collision)}
 	p := catalogProvider(t, "p", shared, remote)
 	catalog := requireCatalog(t, static, map[string]P.ProxyProvider{"p": p})
-	events := NewEventIDs(static)
+	providers := map[string]P.ProxyProvider{"p": p}
+	events := NewEventIDs(static, providers)
 	if got := events.ID(shared, shared.Name(), "p"); got != catalog.ID(shared) || got != "shared" {
 		t.Fatalf("compatible provider changed static event identity: %q", got)
 	}
 	if got := events.ID(remote, remote.Name(), "p"); got != catalog.ID(remote) {
 		t.Fatalf("provider event and catalog disagree: event=%q catalog=%q", got, catalog.ID(remote))
 	}
-	// A refresh creates new proxy objects; identity still derives from the same
-	// provider/name tuple and fixed static namespace.
+	// Matching labels alone do not prove that an object belongs to this active
+	// configuration. A cancelled task may complete after its proxy was replaced.
 	refreshed := catalogProxy(remote.Name())
-	if got := events.ID(refreshed, refreshed.Name(), "p"); got != catalog.ID(remote) {
-		t.Fatal("provider refresh broke event identity")
+	if got := events.ID(refreshed, refreshed.Name(), "p"); got != "" {
+		t.Fatal("an object outside the current provider published an event")
 	}
-	if got := events.ID(nil, "unknown-static", ""); got != "unknown-static" {
-		t.Fatalf("static event fallback changed: %q", got)
+	if got := events.ID(nil, "unknown-static", ""); got != "" {
+		t.Fatalf("unknown static event was not suppressed: %q", got)
+	}
+	newShared := catalogProxy(shared.Name())
+	newP := catalogProvider(t, "p", refreshed, newShared)
+	newEvents := NewEventIDs(map[string]C.Proxy{"shared": newShared, collision: static[collision]}, map[string]P.ProxyProvider{"p": newP})
+	if newEvents.ID(shared, shared.Name(), "p") != "" || newEvents.ID(remote, remote.Name(), "p") != "" {
+		t.Fatal("old configuration objects can publish into a replacement configuration")
+	}
+	if newEvents.ID(newShared, newShared.Name(), "p") != "shared" || newEvents.ID(refreshed, refreshed.Name(), "p") != catalog.ID(remote) {
+		t.Fatal("replacement configuration lost valid static/provider identities")
+	}
+	if got := events.ID(remote, remote.Name(), "other-provider"); got != "" {
+		t.Fatal("provider metadata can relabel an object from another provider")
 	}
 	want := catalog.ID(remote)
 	// The published event mapping owns both maps: later caller map changes
@@ -330,5 +353,6 @@ func TestEventIDsMatchCatalogForStaticSharedAndProviderNodes(t *testing.T) {
 	delete(static, "shared")
 	delete(static, collision)
 	static["replacement"] = catalogProxy("replacement")
+	delete(providers, "p")
 	workers.Wait()
 }
